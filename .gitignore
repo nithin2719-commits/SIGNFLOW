@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+__pycache__/
+
+# Data directories (too large for GitHub)
+landmark_data/
+landmark_data_random_split/
+MS-ASL/
+mediapipe_models/
+ffmpeg-*/
+
+# Logs
+*.log
+*.txt
+!README.txt
+
+# Old model outputs
+outputs/landmark_transformer_1000/
+outputs/landmark_transformer_95/
+outputs/landmark_transformer_finetune/
+
+# Training log (large with duplicates)
+outputs/landmark_transformer_3d/training_log.csv
+outputs/landmark_transformer_3d/latest_checkpoint.pth
