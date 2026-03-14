@@ -298,8 +298,6 @@ class OverlayWindow(QWidget):
     def on_model_changed(self, text: str):
         self.model_selection = text
         self._write_preferences()
-        if self.hand_worker is not None:
-            self.hand_worker.set_model(text)
 
     def on_show_latency_toggled(self, checked: bool):
         self.show_latency = checked
@@ -474,7 +472,6 @@ class OverlayWindow(QWidget):
 
         if self.hand_worker is None:
             self.hand_worker = HandTrackingWorker(flip_horizontal=CAPTURE_FLIP_HORIZONTAL)
-            self.hand_worker.set_model(self.model_selection)
             self.hand_worker.status_updated.connect(self._on_detection_status)
             self.hand_worker.frame_processed.connect(self._on_processed_frame)
             self.hand_worker.fps_updated.connect(self._on_processing_fps)

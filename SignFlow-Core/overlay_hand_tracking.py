@@ -410,11 +410,9 @@ def run_transformer_inference(model, frames_list, device):
 class HandTracker:
     def __init__(self):
         self.available = _MP_TASKS_AVAILABLE
-        self._active_model = "Local Small"  # current model selection
 
         # --- sklearn model (Local Small) ---
         self._sklearn_model = None
-        self._sklearn_hand_lm = None  # Tasks API HandLandmarker for sklearn
 
         # --- transformer model (Local Medium) ---
         self._transformer_model = None
@@ -446,22 +444,6 @@ class HandTracker:
                     self._sklearn_model = joblib.load(os.fspath(model_path))
                 except Exception:
                     self._sklearn_model = None
-
-        # --- Init MediaPipe Tasks HandLandmarker for sklearn model ---
-        if mp_model_dir.exists():
-            hand_task = str(mp_model_dir / "hand_landmarker.task")
-            if os.path.exists(hand_task):
-                try:
-                    self._sklearn_hand_lm = HandLandmarker.create_from_options(
-                        HandLandmarkerOptions(
-                            base_options=BaseOptions(model_asset_path=hand_task),
-                            running_mode=RunningMode.IMAGE,
-                            num_hands=2,
-                            min_hand_detection_confidence=0.5,
-                            min_hand_presence_confidence=0.5,
-                        ))
-                except Exception:
-                    self._sklearn_hand_lm = None
 
         # --- Load transformer model ---
         if torch is not None and LandmarkTransformer is not None:
@@ -521,160 +503,15 @@ class HandTracker:
                 except Exception as e:
                     print(f"[SignFlow] MediaPipe Tasks init error: {e}")
 
-    def set_model(self, model_name: str):
-        """Switch active model. Called when user changes dropdown."""
-        self._active_model = model_name
-        # Reset transformer state when switching
-        self._landmark_buffer.clear()
-        self._avg_probs = None
-        self._frame_count = 0
-
     def process(self, frame: dict, flip_horizontal: bool = False):
-        """Process a captured frame. Route to the active model."""
-        if not self.available or frame is None:
-            return frame, self.last_status
+        """Process a frame with BOTH models, pick the best prediction.
 
-        if self._active_model == "Local Medium":
-            return self._process_transformer(frame, flip_horizontal)
-        else:
-            return self._process_sklearn(frame, flip_horizontal)
-
-    # -----------------------------------------------------------
-    # SKLEARN path ("Local Small")
-    # -----------------------------------------------------------
-    def _process_sklearn(self, frame: dict, flip_horizontal: bool = False):
-        if self._sklearn_hand_lm is None:
-            return frame, self.last_status
-
-        rgb = frame.get("rgb")
-        width = int(frame.get("width", 0) or 0)
-        height = int(frame.get("height", 0) or 0)
-        if rgb is None or width <= 0 or height <= 0:
-            return frame, self.last_status
-
-        start_time = time.perf_counter()
-        image = np.frombuffer(rgb, dtype=np.uint8).reshape(height, width, 3).copy()
-        if flip_horizontal:
-            image = image[:, ::-1, :].copy()
-
-        # Detect hands using Tasks API
-        mp_img = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB,
-                              data=np.ascontiguousarray(image))
-        hr = self._sklearn_hand_lm.detect(mp_img)
-
-        left_features = None
-        right_features = None
-        left_conf = 0.0
-        right_conf = 0.0
-        unknown_features = []
-        prediction_text = "No Hand"
-        prediction_conf = 0.0
-        label = None
-        hands_detected = 0
-
-        if hr.hand_landmarks:
-            hands_detected = len(hr.hand_landmarks)
-            h, w = image.shape[:2]
-
-            for hi, hand_lms in enumerate(hr.hand_landmarks):
-                if hi >= 2:
-                    break
-
-                # Draw landmarks on image
-                if cv2 is not None:
-                    for i in range(min(21, len(hand_lms))):
-                        px = int(hand_lms[i].x * w)
-                        py = int(hand_lms[i].y * h)
-                        cv2.circle(image, (px, py), 3, (0, 255, 0), -1)
-                    for a, b in HAND_CONNS:
-                        if a < len(hand_lms) and b < len(hand_lms):
-                            p1 = (int(hand_lms[a].x * w), int(hand_lms[a].y * h))
-                            p2 = (int(hand_lms[b].x * w), int(hand_lms[b].y * h))
-                            cv2.line(image, p1, p2, (0, 255, 0), 2)
-
-                # Build features - create landmark-like objects for build_hand_features
-                class _LM:
-                    __slots__ = ('x', 'y', 'z')
-                    def __init__(self, x, y, z):
-                        self.x = x
-                        self.y = y
-                        self.z = z
-
-                lm_list = [_LM(l.x, l.y, l.z) for l in hand_lms[:21]]
-                features = build_hand_features(lm_list)
-
-                # Get handedness
-                score = 0.0
-                hand_label = None
-                if hr.handedness and hi < len(hr.handedness):
-                    cat = hr.handedness[hi]
-                    if cat:
-                        hand_label = cat[0].category_name
-                        score = float(cat[0].score)
-
-                if hand_label == "Right":
-                    right_features = features
-                    right_conf = score
-                    label = "Right"
-                elif hand_label == "Left":
-                    left_features = features
-                    left_conf = score
-                    label = "Left"
-                else:
-                    unknown_features.append((features, score))
-
-            if right_features is None and unknown_features:
-                right_features, right_conf = unknown_features.pop(0)
-            if left_features is None and unknown_features:
-                left_features, left_conf = unknown_features.pop(0)
-
-            # Build combined feature vector and predict
-            primary = right_features if right_features is not None else zero_hand_features()
-            secondary = left_features if left_features is not None else zero_hand_features()
-            only_primary = 1 if right_features is not None and left_features is None else 0
-            combined = [only_primary] + primary + secondary
-
-            if self._sklearn_model is not None:
-                features_arr = np.array(combined, dtype=np.float32).reshape(1, -1)
-                probs = self._sklearn_model.predict_proba(features_arr)[0]
-                prediction_conf = float(np.max(probs))
-                if prediction_conf >= SIGN_PREDICTION_MIN_CONFIDENCE:
-                    prediction_text = self._sklearn_model.predict(features_arr)[0]
-                else:
-                    prediction_text = "Uncertain"
-            else:
-                prediction_text = "No Model"
-
-        processing_ms = (time.perf_counter() - start_time) * 1000.0
-
-        self.last_status = {
-            "hands_detected": hands_detected,
-            "left_conf": left_conf,
-            "right_conf": right_conf,
-            "prediction": prediction_text,
-            "prediction_conf": prediction_conf,
-            "input_w": width,
-            "input_h": height,
-            "det_w": width,
-            "det_h": height,
-            "det_scale": 1.0,
-            "pad_x": 0,
-            "pad_y": 0,
-            "flip": bool(flip_horizontal),
-            "model_loaded": self._sklearn_model is not None,
-            "hand_label": label or "Unknown",
-            "processing_ms": processing_ms,
-        }
-
-        out_frame = dict(frame)
-        out_frame["rgb"] = image.tobytes()
-        return out_frame, self.last_status
-
-    # -----------------------------------------------------------
-    # TRANSFORMER path ("Local Medium")
-    # -----------------------------------------------------------
-    def _process_transformer(self, frame: dict, flip_horizontal: bool = False):
-        if self._tasks_extractor is None:
+        1. Extract 92 landmarks (face+hands+pose) via Tasks API — one pass
+        2. From hand landmarks, run sklearn instantly (static signs like A-Z)
+        3. Buffer landmarks, run transformer every N frames (motion signs like Hello)
+        4. Show whichever prediction has higher confidence
+        """
+        if not self.available or frame is None or self._tasks_extractor is None:
             return frame, self.last_status
 
         rgb = frame.get("rgb")
@@ -686,17 +523,16 @@ class HandTracker:
         start_time = time.perf_counter()
         image = np.frombuffer(rgb, dtype=np.uint8).reshape(height, width, 3).copy()
 
-        # For screen capture: the frame is already in the right orientation.
-        # flip_horizontal is for display mirroring of webcam-like feeds.
-        # Extract landmarks from the un-flipped image.
+        # Extract landmarks from the original image orientation
         if flip_horizontal:
             extract_image = image[:, ::-1, :].copy()
         else:
             extract_image = image
 
+        # --- Step 1: Extract all 92 landmarks (single MediaPipe pass) ---
         lm, face_ok, hands_ok, pose_ok = self._tasks_extractor.extract(extract_image)
 
-        # Draw landmarks on the display image
+        # Draw landmarks on display image
         if cv2 is not None:
             if flip_horizontal:
                 display_lm = lm.copy()
@@ -707,11 +543,50 @@ class HandTracker:
                 draw_92_landmarks(image, lm)
 
         hands_visible = np.any(lm[40:82] != 0)
+        lh_visible = np.any(lm[40:61] != 0)
+        rh_visible = np.any(lm[61:82] != 0)
+
+        # --- Step 2: sklearn instant prediction (static signs) ---
+        sklearn_text = "No Hand"
+        sklearn_conf = 0.0
+
+        if hands_visible and self._sklearn_model is not None:
+            # Build features from the 92-landmark array hand slots
+            class _LM:
+                __slots__ = ('x', 'y', 'z')
+                def __init__(self, x, y, z):
+                    self.x = x; self.y = y; self.z = z
+
+            left_features = None
+            right_features = None
+
+            if rh_visible:
+                rh_lms = [_LM(lm[61 + i, 0], lm[61 + i, 1], lm[61 + i, 2]) for i in range(21)]
+                right_features = build_hand_features(rh_lms)
+            if lh_visible:
+                lh_lms = [_LM(lm[40 + i, 0], lm[40 + i, 1], lm[40 + i, 2]) for i in range(21)]
+                left_features = build_hand_features(lh_lms)
+
+            primary = right_features if right_features is not None else zero_hand_features()
+            secondary = left_features if left_features is not None else zero_hand_features()
+            only_primary = 1 if right_features is not None and left_features is None else 0
+            combined = [only_primary] + primary + secondary
+
+            features_arr = np.array(combined, dtype=np.float32).reshape(1, -1)
+            probs = self._sklearn_model.predict_proba(features_arr)[0]
+            sklearn_conf = float(np.max(probs))
+            if sklearn_conf >= 0.5:  # sklearn needs higher threshold for reliable static
+                sklearn_text = self._sklearn_model.predict(features_arr)[0]
+            else:
+                sklearn_text = "Uncertain"
+
+        # --- Step 3: Transformer sequence prediction (motion signs) ---
+        transformer_text = "No Hand"
+        transformer_conf = 0.0
+
         if hands_visible:
             self._landmark_buffer.append(lm.copy())
 
-        prediction_text = "No Hand"
-        prediction_conf = 0.0
         self._frame_count += 1
 
         if (self._frame_count % PREDICT_INTERVAL == 0
@@ -725,27 +600,40 @@ class HandTracker:
                     self._avg_probs = probs
                 else:
                     self._avg_probs = SMOOTH_ALPHA * probs + (1 - SMOOTH_ALPHA) * self._avg_probs
-                top_idx = int(np.argmax(self._avg_probs))
-                prediction_conf = float(self._avg_probs[top_idx])
-                if prediction_conf >= SIGN_PREDICTION_MIN_CONFIDENCE:
-                    prediction_text = self._transformer_class_names.get(top_idx, str(top_idx))
-                else:
-                    prediction_text = "Uncertain"
-        elif self._avg_probs is not None:
+
+        if self._avg_probs is not None:
             top_idx = int(np.argmax(self._avg_probs))
-            prediction_conf = float(self._avg_probs[top_idx])
-            if prediction_conf >= SIGN_PREDICTION_MIN_CONFIDENCE:
-                prediction_text = self._transformer_class_names.get(top_idx, str(top_idx))
-            elif hands_visible:
-                prediction_text = "Uncertain"
-        elif self._transformer_model is None:
-            prediction_text = "No Model"
+            transformer_conf = float(self._avg_probs[top_idx])
+            if transformer_conf >= SIGN_PREDICTION_MIN_CONFIDENCE:
+                transformer_text = self._transformer_class_names.get(top_idx, str(top_idx))
+            else:
+                transformer_text = "Uncertain"
 
-        if not hands_visible and self._avg_probs is None:
+        # --- Step 4: Pick the best prediction ---
+        prediction_text = "No Hand"
+        prediction_conf = 0.0
+
+        if not hands_visible:
             prediction_text = "No Hand"
+            prediction_conf = 0.0
+        elif transformer_conf >= sklearn_conf:
+            prediction_text = transformer_text
+            prediction_conf = transformer_conf
+        else:
+            prediction_text = sklearn_text
+            prediction_conf = sklearn_conf
 
-        lh_conf = 1.0 if np.any(lm[40:61] != 0) else 0.0
-        rh_conf = 1.0 if np.any(lm[61:82] != 0) else 0.0
+        # If both uncertain, show best available
+        if prediction_text == "Uncertain" and hands_visible:
+            if transformer_conf > sklearn_conf and transformer_text != "Uncertain":
+                prediction_text = transformer_text
+                prediction_conf = transformer_conf
+            elif sklearn_text != "Uncertain":
+                prediction_text = sklearn_text
+                prediction_conf = sklearn_conf
+
+        lh_conf = 1.0 if lh_visible else 0.0
+        rh_conf = 1.0 if rh_visible else 0.0
         hands_detected = int(lh_conf > 0) + int(rh_conf > 0)
         processing_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -763,7 +651,8 @@ class HandTracker:
             "pad_x": 0,
             "pad_y": 0,
             "flip": bool(flip_horizontal),
-            "model_loaded": self._transformer_model is not None,
+            "model_loaded": (self._sklearn_model is not None or
+                             self._transformer_model is not None),
             "hand_label": ("Both" if (lh_conf > 0 and rh_conf > 0)
                            else "Left" if lh_conf > 0
                            else "Right" if rh_conf > 0
@@ -772,6 +661,10 @@ class HandTracker:
             "face_ok": face_ok,
             "pose_ok": pose_ok,
             "buffer_size": len(self._landmark_buffer),
+            "sklearn_pred": sklearn_text,
+            "sklearn_conf": sklearn_conf,
+            "transformer_pred": transformer_text,
+            "transformer_conf": transformer_conf,
         }
 
         out_frame = dict(frame)
@@ -781,8 +674,6 @@ class HandTracker:
     def close(self):
         if self._tasks_extractor is not None:
             self._tasks_extractor.close()
-        if self._sklearn_hand_lm is not None:
-            self._sklearn_hand_lm.close()
 
 
 # ===============================================================
@@ -808,10 +699,6 @@ class HandTrackingWorker(QThread):
     @property
     def available(self):
         return self._tracker.available
-
-    def set_model(self, model_name: str):
-        """Switch the active model (called from UI thread)."""
-        self._tracker.set_model(model_name)
 
     def submit(self, frame: dict):
         if not self.available or frame is None:

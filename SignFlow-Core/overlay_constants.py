@@ -96,7 +96,7 @@ CORNER_BOTTOM_LEFT = "Bottom Left"
 CORNER_BOTTOM_RIGHT = "Bottom Right"
 DEFAULT_CORNER = CORNER_BOTTOM_RIGHT
 CORNER_OPTIONS = [CORNER_TOP_LEFT, CORNER_TOP_RIGHT, CORNER_BOTTOM_LEFT, CORNER_BOTTOM_RIGHT]
-MODEL_OPTIONS = ["Local Small", "Local Medium"]
+MODEL_OPTIONS = ["Combined (Static + Motion)"]
 
 # PREFERENCES
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -109,7 +109,7 @@ DEFAULT_SETTINGS = {
     "show_raw_tokens": False,
     "freeze_on_detection_loss": False,
     "enable_llm_smoothing": False,
-    "model_selection": MODEL_OPTIONS[1],
+    "model_selection": MODEL_OPTIONS[0],
     "show_latency": False,
     "corner": DEFAULT_CORNER,
 }
