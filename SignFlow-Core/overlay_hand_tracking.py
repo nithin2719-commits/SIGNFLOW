@@ -97,27 +97,29 @@ HAND_CONNS = [
 # ===============================================================
 # HAND CROP HELPER (for SigLIP2 image-based alphabet model)
 # ===============================================================
-HAND_CROP_PADDING = 0.3  # 30% padding around bounding box
+HAND_CROP_PADDING = 0.65  # 65% padding — generous context around the hand
+SIGLIP_SMOOTH_ALPHA = 0.5  # EMA smoothing for SigLIP predictions
+MIN_CROP_PX = 40  # minimum crop size in pixels (skip tiny crops)
 
 
 def crop_hand_region(image, lm_92, offset, h, w):
-    """Crop the hand region from image using landmarks at lm_92[offset:offset+21].
-    Returns an RGB PIL Image or None if no hand is visible."""
+    """Crop a square hand region from image using landmarks at lm_92[offset:offset+21].
+    Returns (original_pil, flipped_pil) or (None, None) if no hand visible."""
     hand_lm = lm_92[offset:offset + 21]
     valid = np.any(hand_lm != 0, axis=1)
     if not np.any(valid):
-        return None
+        return None, None
     pts = hand_lm[valid, :2]  # (N, 2) in [0..1]
     x_min, y_min = pts.min(axis=0)
     x_max, y_max = pts.max(axis=0)
-    # Add padding
+    # Add generous padding
     dx = (x_max - x_min) * HAND_CROP_PADDING
     dy = (y_max - y_min) * HAND_CROP_PADDING
     x_min = max(0.0, x_min - dx)
     y_min = max(0.0, y_min - dy)
     x_max = min(1.0, x_max + dx)
     y_max = min(1.0, y_max + dy)
-    # Make square (SigLIP expects square-ish input)
+    # Make square (SigLIP expects square input)
     cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
     side = max(x_max - x_min, y_max - y_min)
     x_min = max(0.0, cx - side / 2)
@@ -127,10 +129,14 @@ def crop_hand_region(image, lm_92, offset, h, w):
     # Convert to pixel coords
     px1, py1 = int(x_min * w), int(y_min * h)
     px2, py2 = int(x_max * w), int(y_max * h)
-    if px2 - px1 < 10 or py2 - py1 < 10:
-        return None
+    if px2 - px1 < MIN_CROP_PX or py2 - py1 < MIN_CROP_PX:
+        return None, None
     crop = image[py1:py2, px1:px2]
-    return PILImage.fromarray(crop) if _SIGLIP_AVAILABLE else None
+    if not _SIGLIP_AVAILABLE:
+        return None, None
+    original = PILImage.fromarray(crop)
+    flipped = original.transpose(PILImage.FLIP_LEFT_RIGHT)
+    return original, flipped
 
 
 # ===============================================================
@@ -406,6 +412,8 @@ class HandTracker:
         self._siglip_model = None
         self._siglip_processor = None
         self._siglip_device = None
+        self._siglip_avg_label = None  # EMA-smoothed label tracking
+        self._siglip_avg_conf = 0.0    # EMA-smoothed confidence
 
         # --- transformer model (Local Medium) ---
         self._transformer_model = None
@@ -440,6 +448,9 @@ class HandTracker:
                         str(siglip_dir))
                     self._siglip_model = AutoModelForImageClassification.from_pretrained(
                         str(siglip_dir)).to(self._siglip_device).eval()
+                    # Use half-precision on CUDA for faster inference
+                    if self._siglip_device.type == "cuda":
+                        self._siglip_model = self._siglip_model.half()
                     print(f"[SignFlow] SigLIP2 alphabet model loaded ({self._siglip_model.config.num_labels} classes)")
                 except Exception as e:
                     print(f"[SignFlow] SigLIP2 model load error: {e}")
@@ -551,32 +562,58 @@ class HandTracker:
         siglip_conf = 0.0
 
         if hands_visible and self._siglip_model is not None and self._siglip_processor is not None:
-            # Crop hand region(s) from image and run SigLIP2
-            best_crop_conf = 0.0
-            best_crop_label = "No Hand"
+            # Crop hand region(s), try BOTH original + flipped orientations
+            best_raw_conf = 0.0
+            best_raw_label = "No Hand"
 
-            for offset in [61, 40]:  # try right hand first, then left
-                hand_crop = crop_hand_region(extract_image, lm, offset, height, width)
-                if hand_crop is None:
+            for offset in [61, 40]:  # right hand first, then left
+                orig_crop, flip_crop = crop_hand_region(extract_image, lm, offset, height, width)
+                if orig_crop is None:
                     continue
-                try:
-                    inputs = self._siglip_processor(images=hand_crop, return_tensors="pt")
-                    inputs = {k: v.to(self._siglip_device) for k, v in inputs.items()}
-                    with torch.no_grad():
-                        logits = self._siglip_model(**inputs).logits
-                        probs = torch.softmax(logits, dim=1)[0]
-                    top_conf = float(probs.max())
-                    top_idx = int(probs.argmax())
-                    top_label = self._siglip_model.config.id2label.get(top_idx, str(top_idx))
-                    if top_conf > best_crop_conf:
-                        best_crop_conf = top_conf
-                        best_crop_label = top_label
-                except Exception:
-                    pass
+                # Test both orientations — training data may differ from screen capture
+                for crop_img in [orig_crop, flip_crop]:
+                    try:
+                        inputs = self._siglip_processor(images=crop_img, return_tensors="pt")
+                        inputs = {k: v.to(self._siglip_device) for k, v in inputs.items()}
+                        with torch.no_grad():
+                            if self._siglip_device.type == "cuda":
+                                with torch.amp.autocast("cuda"):
+                                    logits = self._siglip_model(**inputs).logits
+                            else:
+                                logits = self._siglip_model(**inputs).logits
+                            probs = torch.softmax(logits.float(), dim=1)[0]
+                        top_conf = float(probs.max())
+                        top_idx = int(probs.argmax())
+                        if top_conf > best_raw_conf:
+                            best_raw_conf = top_conf
+                            best_raw_label = self._siglip_model.config.id2label.get(
+                                top_idx, str(top_idx))
+                    except Exception:
+                        pass
 
-            if best_crop_conf >= 0.3:
-                siglip_text = best_crop_label
-                siglip_conf = best_crop_conf
+            # EMA smoothing for stable predictions
+            if best_raw_conf >= 0.25:
+                if self._siglip_avg_label == best_raw_label:
+                    # Same label — smooth confidence upward
+                    self._siglip_avg_conf = (
+                        SIGLIP_SMOOTH_ALPHA * best_raw_conf
+                        + (1 - SIGLIP_SMOOTH_ALPHA) * self._siglip_avg_conf)
+                else:
+                    # New label detected — only switch if confident enough
+                    if best_raw_conf > self._siglip_avg_conf * 0.8:
+                        self._siglip_avg_label = best_raw_label
+                        self._siglip_avg_conf = best_raw_conf * 0.7
+                siglip_text = self._siglip_avg_label
+                siglip_conf = self._siglip_avg_conf
+            else:
+                # Decay confidence when no good detection
+                self._siglip_avg_conf *= 0.8
+                if self._siglip_avg_conf > 0.15 and self._siglip_avg_label is not None:
+                    siglip_text = self._siglip_avg_label
+                    siglip_conf = self._siglip_avg_conf
+                else:
+                    self._siglip_avg_label = None
+                    self._siglip_avg_conf = 0.0
 
         # --- Step 3: Transformer sequence prediction (motion signs) ---
         transformer_text = "No Hand"
