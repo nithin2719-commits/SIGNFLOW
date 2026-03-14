@@ -51,9 +51,6 @@ LIPS_FACE_IDXS = np.array([
 
 POSE_UPPER_IDXS = np.array([0, 11, 12, 13, 14, 15, 16, 23, 24, 25], dtype=np.int32)
 
-# MediaPipe pose: face-related landmarks (nose, eyes, ears, mouth corners)
-POSE_FACE_IDXS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-
 HAND_CONNS = [
     (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
     (0,9),(9,10),(10,11),(11,12),(0,13),(13,14),(14,15),(15,16),
@@ -252,34 +249,6 @@ class LandmarkExtractor:
                 if pidx < len(pose):
                     lm[82 + k] = [pose[pidx].x, pose[pidx].y, pose[pidx].z]
 
-            # If face landmarker failed, use pose face landmarks as approximate lips
-            # This gives the model SOMETHING in the lip slots instead of all zeros
-            if not face_ok and len(pose) > 10:
-                nose = pose[0]
-                mouth_l = pose[9] if 9 < len(pose) else nose
-                mouth_r = pose[10] if 10 < len(pose) else nose
-                # Fill lip slots with approximate positions from pose
-                # Use nose, mouth corners, and interpolate to create 40 approximate points
-                # This won't be perfect but gives the model face-region signal
-                lip_center_x = (mouth_l.x + mouth_r.x) / 2
-                lip_center_y = (mouth_l.y + mouth_r.y) / 2
-                lip_center_z = (mouth_l.z + mouth_r.z) / 2
-                lip_width = abs(mouth_r.x - mouth_l.x) * 0.5
-                lip_height = lip_width * 0.4
-
-                for i in range(40):
-                    # Distribute points in an ellipse around lip center
-                    angle = 2 * np.pi * i / 40
-                    if i < 20:
-                        # Outer lip
-                        rx, ry = lip_width, lip_height
-                    else:
-                        # Inner lip (smaller)
-                        rx, ry = lip_width * 0.6, lip_height * 0.5
-                    lm[i, 0] = lip_center_x + rx * np.cos(angle)
-                    lm[i, 1] = lip_center_y + ry * np.sin(angle)
-                    lm[i, 2] = lip_center_z
-
         return lm, face_ok
 
     def close(self):
@@ -393,7 +362,7 @@ def draw_ui(frame, sign, conf, top5, face_ok, hands_ok, pose_ok, buf_sz, fps):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150,150,150), 1)
 
     if not face_ok:
-        cv2.putText(frame, "(lips from pose)", (x+10, 46),
+        cv2.putText(frame, "(no face - OK)", (x+10, 46),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,200,0), 1)
 
     # Prediction
@@ -428,7 +397,7 @@ def main():
     parser = argparse.ArgumentParser(description="Real-time ASL Sign Recognition")
     parser.add_argument("--model", type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                             "outputs", "landmark_transformer_3d", "best_model.pth"))
+                                             "outputs", "landmark_transformer_3d_v2", "best_model.pth"))
     parser.add_argument("--mediapipe-dir", type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "mediapipe_models"))
     parser.add_argument("--camera", type=int, default=0)
@@ -497,8 +466,8 @@ def main():
         test_rgb = cv2.cvtColor(test_bgr, cv2.COLOR_BGR2RGB)
         _, face_ok = extractor.extract(test_rgb)
         if not face_ok:
-            print("NOTE: Face landmarks not detected - using pose estimation for lip region")
-            print("      This is normal for some webcams. Predictions will still work.")
+            print("NOTE: Face landmarks not detected - model handles this natively (lip dropout training)")
+            print("      Predictions will work without face detection.")
         else:
             print("Face landmarks: OK")
 

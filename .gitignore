@@ -28,3 +28,5 @@ outputs/msasl_top100_gpu/
 # Training log (large with duplicates)
 outputs/landmark_transformer_3d/training_log.csv
 outputs/landmark_transformer_3d/latest_checkpoint.pth
+outputs/landmark_transformer_3d_v2/training_log.csv
+outputs/landmark_transformer_3d_v2/latest_checkpoint.pth

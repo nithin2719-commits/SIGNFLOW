@@ -153,8 +153,10 @@ class LandmarkDataset(Dataset):
         # Random scale
         if random.random() < 0.5:
             scale = random.uniform(0.9, 1.1)
-            center_x = np.mean(landmarks[:, :, 0][landmarks[:, :, 0] != 0]) if np.any(landmarks[:, :, 0] != 0) else 0.5
-            center_y = np.mean(landmarks[:, :, 1][landmarks[:, :, 1] != 0]) if np.any(landmarks[:, :, 1] != 0) else 0.5
+            nonzero_x = landmarks[:, :, 0][landmarks[:, :, 0] != 0]
+            nonzero_y = landmarks[:, :, 1][landmarks[:, :, 1] != 0]
+            center_x = float(np.mean(nonzero_x)) if len(nonzero_x) > 0 else 0.5
+            center_y = float(np.mean(nonzero_y)) if len(nonzero_y) > 0 else 0.5
             mask = (landmarks != 0).astype(np.float32)
             landmarks[:, :, 0] = (landmarks[:, :, 0] - center_x) * scale + center_x
             landmarks[:, :, 1] = (landmarks[:, :, 1] - center_y) * scale + center_y
@@ -167,8 +169,10 @@ class LandmarkDataset(Dataset):
             x = landmarks[:, :, 0].copy()
             y = landmarks[:, :, 1].copy()
             mask = ((x != 0) | (y != 0)).astype(np.float32)
-            cx = np.mean(x[x != 0]) if np.any(x != 0) else 0.5
-            cy = np.mean(y[y != 0]) if np.any(y != 0) else 0.5
+            nonzero_x = x[x != 0]
+            nonzero_y = y[y != 0]
+            cx = float(np.mean(nonzero_x)) if len(nonzero_x) > 0 else 0.5
+            cy = float(np.mean(nonzero_y)) if len(nonzero_y) > 0 else 0.5
             landmarks[:, :, 0] = ((x - cx) * cos_a - (y - cy) * sin_a + cx) * mask
             landmarks[:, :, 1] = ((x - cx) * sin_a + (y - cy) * cos_a + cy) * mask
 
@@ -177,6 +181,28 @@ class LandmarkDataset(Dataset):
             num_drop = random.randint(1, max(1, self.max_frames // 10))
             drop_indices = random.sample(range(self.max_frames), num_drop)
             landmarks[drop_indices] = 0.0
+
+        # Random body part dropout (critical for webcam robustness)
+        # Many webcams fail to detect face/lips, so model must learn without them
+        # Apply ONLY to non-empty frames to avoid all-zero sequences
+        non_empty_mask = np.any(landmarks != 0, axis=(1, 2))
+        if non_empty_mask.any():
+            drop_lips = random.random() < 0.5
+            drop_lh = random.random() < 0.1
+            drop_rh = random.random() < 0.1
+            drop_pose = random.random() < 0.1
+            # Never drop everything - always keep at least hands or pose
+            if drop_lips and drop_lh and drop_rh and drop_pose:
+                drop_pose = False  # keep pose as fallback
+            ne_idx = np.where(non_empty_mask)[0]
+            if drop_lips:
+                landmarks[np.ix_(ne_idx, range(0, 40))] = 0.0
+            if drop_lh:
+                landmarks[np.ix_(ne_idx, range(40, 61))] = 0.0
+            if drop_rh:
+                landmarks[np.ix_(ne_idx, range(61, 82))] = 0.0
+            if drop_pose:
+                landmarks[np.ix_(ne_idx, range(82, 92))] = 0.0
 
         return landmarks
 
@@ -205,8 +231,23 @@ class LandmarkDataset(Dataset):
         else:
             landmarks = self._pad_truncate(landmarks)
 
+        # Safety: if augmentation produced an all-empty sequence, reload without augmentation
+        if not np.any(landmarks != 0):
+            landmarks = np.load(npy_path).astype(np.float32)
+            if landmarks.shape[1] != NUM_LANDMARKS:
+                if landmarks.shape[1] < NUM_LANDMARKS:
+                    pad = np.zeros((landmarks.shape[0], NUM_LANDMARKS - landmarks.shape[1], landmarks.shape[2]), dtype=np.float32)
+                    landmarks = np.concatenate([landmarks, pad], axis=1)
+                else:
+                    landmarks = landmarks[:, :NUM_LANDMARKS, :]
+            landmarks = self._pad_truncate(landmarks)
+
         # Compute non-empty frame indices for positional encoding
         non_empty = np.any(landmarks != 0, axis=(1, 2))
+        # Ensure at least one frame is non-empty to prevent NaN in attention
+        if not np.any(non_empty):
+            non_empty[0] = True
+            landmarks[0, 0, 0] = 1e-7  # tiny value to avoid all-zero
         non_empty_idxs = np.where(non_empty, np.arange(self.max_frames, dtype=np.float32), -1.0)
 
         return (
