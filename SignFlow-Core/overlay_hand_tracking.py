@@ -1,12 +1,12 @@
 """
 Hand tracking and ASL sign prediction for the SignFlow overlay.
 
-Supports two models:
-- "Local Small" : sklearn model (model.pkl) using 21-landmark hand features (fast, alphabet-level)
-- "Local Medium": 3D Landmark Transformer (best_model.pth) using 92 landmarks (256 ASL signs)
+Supports two models running simultaneously:
+- SigLIP2 vision model (asl_alphabet_siglip/) — 99.96% accuracy on ASL A-Z static alphabet
+- 3D Landmark Transformer (best_model.pth) — 256 ASL motion signs (Hello, Thank you, etc.)
 
-The screen capture feeds frames here. MediaPipe extracts landmarks. The selected
-model produces predictions displayed as captions in the overlay.
+The screen capture feeds frames here. MediaPipe extracts landmarks and hand crops.
+Both models run every frame and the highest-confidence prediction is shown.
 """
 
 import collections
@@ -37,10 +37,13 @@ try:
 except Exception:
     cv2 = None
 
+# SigLIP2 ASL alphabet model (static A-Z classification)
 try:
-    import joblib
+    from transformers import AutoImageProcessor, AutoModelForImageClassification
+    from PIL import Image as PILImage
+    _SIGLIP_AVAILABLE = True
 except Exception:
-    joblib = None
+    _SIGLIP_AVAILABLE = False
 
 # MediaPipe Tasks API (for both models)
 try:
@@ -92,54 +95,42 @@ HAND_CONNS = [
 
 
 # ===============================================================
-# SKLEARN MODEL HELPERS ("Local Small" - model.pkl)
+# HAND CROP HELPER (for SigLIP2 image-based alphabet model)
 # ===============================================================
-def normalize_landmarks(landmarks):
-    lm = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32)
-    base = lm[0]
-    lm = lm - base
-    scale = np.linalg.norm(lm[9]) if lm.shape[0] > 9 else 0.0
-    if scale < 1e-6:
-        scale = 1.0
-    return lm / scale
+HAND_CROP_PADDING = 0.3  # 30% padding around bounding box
 
 
-def angle_at(a, b, c):
-    ba = a - b
-    bc = c - b
-    denom = np.linalg.norm(ba) * np.linalg.norm(bc)
-    if denom < 1e-6:
-        return 0.0
-    cos = float(np.dot(ba, bc) / denom)
-    cos = max(-1.0, min(1.0, cos))
-    return float(np.arccos(cos))
-
-
-def compute_angles(lm):
-    idx = lambda i: lm[i]
-    return [
-        angle_at(idx(1), idx(2), idx(3)),
-        angle_at(idx(2), idx(3), idx(4)),
-        angle_at(idx(5), idx(6), idx(7)),
-        angle_at(idx(6), idx(7), idx(8)),
-        angle_at(idx(9), idx(10), idx(11)),
-        angle_at(idx(10), idx(11), idx(12)),
-        angle_at(idx(13), idx(14), idx(15)),
-        angle_at(idx(14), idx(15), idx(16)),
-        angle_at(idx(17), idx(18), idx(19)),
-        angle_at(idx(18), idx(19), idx(20)),
-    ]
-
-
-def build_hand_features(landmarks):
-    norm = normalize_landmarks(landmarks)
-    coords = norm.flatten().tolist()
-    angles = compute_angles(norm)
-    return coords + angles
-
-
-def zero_hand_features():
-    return [0.0] * 73
+def crop_hand_region(image, lm_92, offset, h, w):
+    """Crop the hand region from image using landmarks at lm_92[offset:offset+21].
+    Returns an RGB PIL Image or None if no hand is visible."""
+    hand_lm = lm_92[offset:offset + 21]
+    valid = np.any(hand_lm != 0, axis=1)
+    if not np.any(valid):
+        return None
+    pts = hand_lm[valid, :2]  # (N, 2) in [0..1]
+    x_min, y_min = pts.min(axis=0)
+    x_max, y_max = pts.max(axis=0)
+    # Add padding
+    dx = (x_max - x_min) * HAND_CROP_PADDING
+    dy = (y_max - y_min) * HAND_CROP_PADDING
+    x_min = max(0.0, x_min - dx)
+    y_min = max(0.0, y_min - dy)
+    x_max = min(1.0, x_max + dx)
+    y_max = min(1.0, y_max + dy)
+    # Make square (SigLIP expects square-ish input)
+    cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
+    side = max(x_max - x_min, y_max - y_min)
+    x_min = max(0.0, cx - side / 2)
+    y_min = max(0.0, cy - side / 2)
+    x_max = min(1.0, cx + side / 2)
+    y_max = min(1.0, cy + side / 2)
+    # Convert to pixel coords
+    px1, py1 = int(x_min * w), int(y_min * h)
+    px2, py2 = int(x_max * w), int(y_max * h)
+    if px2 - px1 < 10 or py2 - py1 < 10:
+        return None
+    crop = image[py1:py2, px1:px2]
+    return PILImage.fromarray(crop) if _SIGLIP_AVAILABLE else None
 
 
 # ===============================================================
@@ -411,8 +402,10 @@ class HandTracker:
     def __init__(self):
         self.available = _MP_TASKS_AVAILABLE
 
-        # --- sklearn model (Local Small) ---
-        self._sklearn_model = None
+        # --- SigLIP2 alphabet model (static A-Z) ---
+        self._siglip_model = None
+        self._siglip_processor = None
+        self._siglip_device = None
 
         # --- transformer model (Local Medium) ---
         self._transformer_model = None
@@ -436,14 +429,21 @@ class HandTracker:
 
         mp_model_dir = Path(__file__).resolve().parent / "mediapipe_models"
 
-        # --- Load sklearn model ---
-        if joblib is not None:
-            model_path = Path(__file__).resolve().parent / "models" / "model.pkl"
-            if model_path.exists():
+        # --- Load SigLIP2 ASL alphabet model ---
+        if _SIGLIP_AVAILABLE and torch is not None:
+            siglip_dir = Path(__file__).resolve().parent / "models" / "asl_alphabet_siglip"
+            if siglip_dir.exists():
                 try:
-                    self._sklearn_model = joblib.load(os.fspath(model_path))
-                except Exception:
-                    self._sklearn_model = None
+                    self._siglip_device = torch.device(
+                        "cuda" if torch.cuda.is_available() else "cpu")
+                    self._siglip_processor = AutoImageProcessor.from_pretrained(
+                        str(siglip_dir))
+                    self._siglip_model = AutoModelForImageClassification.from_pretrained(
+                        str(siglip_dir)).to(self._siglip_device).eval()
+                    print(f"[SignFlow] SigLIP2 alphabet model loaded ({self._siglip_model.config.num_labels} classes)")
+                except Exception as e:
+                    print(f"[SignFlow] SigLIP2 model load error: {e}")
+                    self._siglip_model = None
 
         # --- Load transformer model ---
         if torch is not None and LandmarkTransformer is not None:
@@ -507,7 +507,7 @@ class HandTracker:
         """Process a frame with BOTH models, pick the best prediction.
 
         1. Extract 92 landmarks (face+hands+pose) via Tasks API — one pass
-        2. From hand landmarks, run sklearn instantly (static signs like A-Z)
+        2. Crop hand region and run SigLIP2 (static signs A-Z, 99.96% accuracy)
         3. Buffer landmarks, run transformer every N frames (motion signs like Hello)
         4. Show whichever prediction has higher confidence
         """
@@ -546,39 +546,37 @@ class HandTracker:
         lh_visible = np.any(lm[40:61] != 0)
         rh_visible = np.any(lm[61:82] != 0)
 
-        # --- Step 2: sklearn instant prediction (static signs) ---
-        sklearn_text = "No Hand"
-        sklearn_conf = 0.0
+        # --- Step 2: SigLIP2 alphabet prediction (static signs A-Z) ---
+        siglip_text = "No Hand"
+        siglip_conf = 0.0
 
-        if hands_visible and self._sklearn_model is not None:
-            # Build features from the 92-landmark array hand slots
-            class _LM:
-                __slots__ = ('x', 'y', 'z')
-                def __init__(self, x, y, z):
-                    self.x = x; self.y = y; self.z = z
+        if hands_visible and self._siglip_model is not None and self._siglip_processor is not None:
+            # Crop hand region(s) from image and run SigLIP2
+            best_crop_conf = 0.0
+            best_crop_label = "No Hand"
 
-            left_features = None
-            right_features = None
+            for offset in [61, 40]:  # try right hand first, then left
+                hand_crop = crop_hand_region(extract_image, lm, offset, height, width)
+                if hand_crop is None:
+                    continue
+                try:
+                    inputs = self._siglip_processor(images=hand_crop, return_tensors="pt")
+                    inputs = {k: v.to(self._siglip_device) for k, v in inputs.items()}
+                    with torch.no_grad():
+                        logits = self._siglip_model(**inputs).logits
+                        probs = torch.softmax(logits, dim=1)[0]
+                    top_conf = float(probs.max())
+                    top_idx = int(probs.argmax())
+                    top_label = self._siglip_model.config.id2label.get(top_idx, str(top_idx))
+                    if top_conf > best_crop_conf:
+                        best_crop_conf = top_conf
+                        best_crop_label = top_label
+                except Exception:
+                    pass
 
-            if rh_visible:
-                rh_lms = [_LM(lm[61 + i, 0], lm[61 + i, 1], lm[61 + i, 2]) for i in range(21)]
-                right_features = build_hand_features(rh_lms)
-            if lh_visible:
-                lh_lms = [_LM(lm[40 + i, 0], lm[40 + i, 1], lm[40 + i, 2]) for i in range(21)]
-                left_features = build_hand_features(lh_lms)
-
-            primary = right_features if right_features is not None else zero_hand_features()
-            secondary = left_features if left_features is not None else zero_hand_features()
-            only_primary = 1 if right_features is not None and left_features is None else 0
-            combined = [only_primary] + primary + secondary
-
-            features_arr = np.array(combined, dtype=np.float32).reshape(1, -1)
-            probs = self._sklearn_model.predict_proba(features_arr)[0]
-            sklearn_conf = float(np.max(probs))
-            if sklearn_conf >= 0.5:  # sklearn needs higher threshold for reliable static
-                sklearn_text = self._sklearn_model.predict(features_arr)[0]
-            else:
-                sklearn_text = "Uncertain"
+            if best_crop_conf >= 0.3:
+                siglip_text = best_crop_label
+                siglip_conf = best_crop_conf
 
         # --- Step 3: Transformer sequence prediction (motion signs) ---
         transformer_text = "No Hand"
@@ -616,21 +614,21 @@ class HandTracker:
         if not hands_visible:
             prediction_text = "No Hand"
             prediction_conf = 0.0
-        elif transformer_conf >= sklearn_conf:
+        elif transformer_conf >= siglip_conf:
             prediction_text = transformer_text
             prediction_conf = transformer_conf
         else:
-            prediction_text = sklearn_text
-            prediction_conf = sklearn_conf
+            prediction_text = siglip_text
+            prediction_conf = siglip_conf
 
         # If both uncertain, show best available
         if prediction_text == "Uncertain" and hands_visible:
-            if transformer_conf > sklearn_conf and transformer_text != "Uncertain":
+            if transformer_conf > siglip_conf and transformer_text != "Uncertain":
                 prediction_text = transformer_text
                 prediction_conf = transformer_conf
-            elif sklearn_text != "Uncertain":
-                prediction_text = sklearn_text
-                prediction_conf = sklearn_conf
+            elif siglip_text != "Uncertain":
+                prediction_text = siglip_text
+                prediction_conf = siglip_conf
 
         lh_conf = 1.0 if lh_visible else 0.0
         rh_conf = 1.0 if rh_visible else 0.0
@@ -651,7 +649,7 @@ class HandTracker:
             "pad_x": 0,
             "pad_y": 0,
             "flip": bool(flip_horizontal),
-            "model_loaded": (self._sklearn_model is not None or
+            "model_loaded": (self._siglip_model is not None or
                              self._transformer_model is not None),
             "hand_label": ("Both" if (lh_conf > 0 and rh_conf > 0)
                            else "Left" if lh_conf > 0
@@ -661,8 +659,8 @@ class HandTracker:
             "face_ok": face_ok,
             "pose_ok": pose_ok,
             "buffer_size": len(self._landmark_buffer),
-            "sklearn_pred": sklearn_text,
-            "sklearn_conf": sklearn_conf,
+            "siglip_pred": siglip_text,
+            "siglip_conf": siglip_conf,
             "transformer_pred": transformer_text,
             "transformer_conf": transformer_conf,
         }

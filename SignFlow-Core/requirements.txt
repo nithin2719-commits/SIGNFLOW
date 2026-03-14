@@ -1,8 +1,9 @@
 PyQt5==5.15.11
 mediapipe==0.10.14
-joblib==1.4.2
-scikit-learn==1.4.2
 numpy==1.26.4
 opencv-python==4.9.0.80
 torch>=2.0.0
+transformers>=4.40.0
+Pillow>=10.0.0
+huggingface_hub>=0.20.0
 mss>=9.0.0

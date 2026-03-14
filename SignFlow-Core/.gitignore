@@ -19,3 +19,4 @@ user_preferences.json
 
 # Legacy duplicate model
 models/model___.pkl
+models/model.pkl
