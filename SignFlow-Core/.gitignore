@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
+
+# Build / packaging
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# User preferences
+user_preferences.json
+
+# Old sklearn models (replaced by transformer)
+models/model.pkl
+models/model___.pkl
