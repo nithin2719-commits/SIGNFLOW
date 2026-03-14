@@ -13,11 +13,17 @@ ffmpeg-*/
 *.log
 *.txt
 !README.txt
+!requirements.txt
 
 # Old model outputs
 outputs/landmark_transformer_1000/
 outputs/landmark_transformer_95/
 outputs/landmark_transformer_finetune/
+outputs/msasl_100class_70acc/
+outputs/msasl_bestval/
+outputs/msasl_highacc/
+outputs/msasl_top100_90acc/
+outputs/msasl_top100_gpu/
 
 # Training log (large with duplicates)
 outputs/landmark_transformer_3d/training_log.csv
