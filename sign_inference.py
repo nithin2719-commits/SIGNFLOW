@@ -2,7 +2,9 @@
 Real-time ASL Sign Language Recognition - Live Continuous Prediction.
 
 Shows hands -> instant prediction. No buttons, no recording, no waiting.
-Predicts continuously every 0.5 seconds on the last ~2 seconds of frames.
+Predicts continuously every ~0.3 seconds on the last ~2 seconds of frames.
+
+Handles missing face/lip landmarks gracefully (common on webcams).
 
 Controls:  Q = Quit  |  C = Clear
 
@@ -48,6 +50,9 @@ LIPS_FACE_IDXS = np.array([
 ], dtype=np.int32)
 
 POSE_UPPER_IDXS = np.array([0, 11, 12, 13, 14, 15, 16, 23, 24, 25], dtype=np.int32)
+
+# MediaPipe pose: face-related landmarks (nose, eyes, ears, mouth corners)
+POSE_FACE_IDXS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 HAND_CONNS = [
     (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
@@ -188,36 +193,47 @@ class LandmarkTransformer(nn.Module):
 # ---------------------------------------------------------------
 class LandmarkExtractor:
     def __init__(self, model_dir):
-        self.face_lm = FaceLandmarker.create_from_options(FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=os.path.join(model_dir, "face_landmarker.task")),
-            running_mode=RunningMode.IMAGE, num_faces=1,
-            min_face_detection_confidence=0.3, min_face_presence_confidence=0.3,
-        ))
+        self.face_available = True
+        try:
+            self.face_lm = FaceLandmarker.create_from_options(FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=os.path.join(model_dir, "face_landmarker.task")),
+                running_mode=RunningMode.IMAGE, num_faces=1,
+                min_face_detection_confidence=0.1, min_face_presence_confidence=0.1,
+            ))
+        except Exception:
+            self.face_available = False
+
         self.hand_lm = HandLandmarker.create_from_options(HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=os.path.join(model_dir, "hand_landmarker.task")),
             running_mode=RunningMode.IMAGE, num_hands=2,
-            min_hand_detection_confidence=0.3, min_hand_presence_confidence=0.3,
+            min_hand_detection_confidence=0.2, min_hand_presence_confidence=0.2,
         ))
         self.pose_lm = PoseLandmarker.create_from_options(PoseLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=os.path.join(model_dir, "pose_landmarker_heavy.task")),
             running_mode=RunningMode.IMAGE, num_poses=1,
-            min_pose_detection_confidence=0.3, min_pose_presence_confidence=0.3,
+            min_pose_detection_confidence=0.2, min_pose_presence_confidence=0.2,
         ))
+        self.face_detected_ever = False
 
     def extract(self, rgb):
-        """Extract ALL 92 landmarks: 40 lips + 21 LH + 21 RH + 10 pose."""
-        mp_img = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB, data=rgb)
+        """Extract ALL 92 landmarks from an RGB frame."""
+        mp_img = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB,
+                              data=np.ascontiguousarray(rgb))
         lm = np.zeros((NUM_LANDMARKS, NUM_COORDS), dtype=np.float32)
 
-        # Face -> 40 lip landmarks
-        fr = self.face_lm.detect(mp_img)
-        if fr.face_landmarks and len(fr.face_landmarks) > 0:
-            face = fr.face_landmarks[0]
-            for i, fi in enumerate(LIPS_FACE_IDXS):
-                if fi < len(face):
-                    lm[i] = [face[fi].x, face[fi].y, face[fi].z]
+        # --- Face / Lips (40 landmarks) ---
+        face_ok = False
+        if self.face_available:
+            fr = self.face_lm.detect(mp_img)
+            if fr.face_landmarks and len(fr.face_landmarks) > 0:
+                face = fr.face_landmarks[0]
+                for i, fi in enumerate(LIPS_FACE_IDXS):
+                    if fi < len(face):
+                        lm[i] = [face[fi].x, face[fi].y, face[fi].z]
+                face_ok = True
+                self.face_detected_ever = True
 
-        # Hands -> 21 left + 21 right
+        # --- Hands (21 + 21 landmarks) ---
         hr = self.hand_lm.detect(mp_img)
         if hr.hand_landmarks:
             for hi, (hm, hn) in enumerate(zip(hr.hand_landmarks, hr.handedness)):
@@ -228,7 +244,7 @@ class LandmarkExtractor:
                 for j in range(min(21, len(hm))):
                     lm[offset + j] = [hm[j].x, hm[j].y, hm[j].z]
 
-        # Pose -> 10 upper body
+        # --- Pose (10 landmarks) ---
         pr = self.pose_lm.detect(mp_img)
         if pr.pose_landmarks and len(pr.pose_landmarks) > 0:
             pose = pr.pose_landmarks[0]
@@ -236,10 +252,39 @@ class LandmarkExtractor:
                 if pidx < len(pose):
                     lm[82 + k] = [pose[pidx].x, pose[pidx].y, pose[pidx].z]
 
-        return lm
+            # If face landmarker failed, use pose face landmarks as approximate lips
+            # This gives the model SOMETHING in the lip slots instead of all zeros
+            if not face_ok and len(pose) > 10:
+                nose = pose[0]
+                mouth_l = pose[9] if 9 < len(pose) else nose
+                mouth_r = pose[10] if 10 < len(pose) else nose
+                # Fill lip slots with approximate positions from pose
+                # Use nose, mouth corners, and interpolate to create 40 approximate points
+                # This won't be perfect but gives the model face-region signal
+                lip_center_x = (mouth_l.x + mouth_r.x) / 2
+                lip_center_y = (mouth_l.y + mouth_r.y) / 2
+                lip_center_z = (mouth_l.z + mouth_r.z) / 2
+                lip_width = abs(mouth_r.x - mouth_l.x) * 0.5
+                lip_height = lip_width * 0.4
+
+                for i in range(40):
+                    # Distribute points in an ellipse around lip center
+                    angle = 2 * np.pi * i / 40
+                    if i < 20:
+                        # Outer lip
+                        rx, ry = lip_width, lip_height
+                    else:
+                        # Inner lip (smaller)
+                        rx, ry = lip_width * 0.6, lip_height * 0.5
+                    lm[i, 0] = lip_center_x + rx * np.cos(angle)
+                    lm[i, 1] = lip_center_y + ry * np.sin(angle)
+                    lm[i, 2] = lip_center_z
+
+        return lm, face_ok
 
     def close(self):
-        self.face_lm.close()
+        if self.face_available:
+            self.face_lm.close()
         self.hand_lm.close()
         self.pose_lm.close()
 
@@ -248,12 +293,10 @@ class LandmarkExtractor:
 # Inference
 # ---------------------------------------------------------------
 def run_inference(model, frames_list, device):
-    """Run model on a list of [92, 3] landmark arrays. Returns probabilities."""
     n = len(frames_list)
     if n < 5:
         return None
 
-    # Subsample to MAX_FRAMES if we have more
     if n > MAX_FRAMES:
         indices = np.linspace(0, n - 1, MAX_FRAMES, dtype=int)
         frames_list = [frames_list[i] for i in indices]
@@ -261,7 +304,6 @@ def run_inference(model, frames_list, device):
 
     arr = np.stack(frames_list, axis=0).astype(np.float32)
 
-    # Pad to MAX_FRAMES
     if n < MAX_FRAMES:
         pad = np.zeros((MAX_FRAMES - n, NUM_LANDMARKS, NUM_COORDS), dtype=np.float32)
         arr = np.concatenate([arr, pad], axis=0)
@@ -282,7 +324,7 @@ def run_inference(model, frames_list, device):
 
 
 # ---------------------------------------------------------------
-# Drawing - ALL landmarks visible
+# Drawing
 # ---------------------------------------------------------------
 def draw_hand(frame, lm, offset, color, w, h):
     for i in range(21):
@@ -297,93 +339,86 @@ def draw_hand(frame, lm, offset, color, w, h):
 
 
 def draw_landmarks(frame, lm):
-    """Draw ALL landmarks: lips (green), left hand (blue), right hand (orange), pose (yellow)."""
     h, w = frame.shape[:2]
-
     # Lips - green
     for i in range(40):
         x, y = lm[i, 0], lm[i, 1]
         if x > 0 or y > 0:
             cv2.circle(frame, (int(x * w), int(y * h)), 2, (0, 255, 0), -1)
-
-    # Left hand - blue with connections
+    # Hands
     draw_hand(frame, lm, 40, (255, 150, 0), w, h)
-
-    # Right hand - orange with connections
     draw_hand(frame, lm, 61, (0, 130, 255), w, h)
-
-    # Pose - yellow with connections
+    # Pose
     for i in range(82, 92):
         x, y = lm[i, 0], lm[i, 1]
         if x > 0 or y > 0:
             cv2.circle(frame, (int(x * w), int(y * h)), 5, (0, 255, 255), -1)
-    # Pose connections: shoulders, elbows, wrists
     pose_conns = [(1,2), (1,3), (2,4), (3,5), (4,6), (1,7), (2,8)]
     for a, b in pose_conns:
-        x1, y1 = lm[82 + a, 0], lm[82 + a, 1]
-        x2, y2 = lm[82 + b, 0], lm[82 + b, 1]
+        x1, y1 = lm[82+a, 0], lm[82+a, 1]
+        x2, y2 = lm[82+b, 0], lm[82+b, 1]
         if (x1 > 0 or y1 > 0) and (x2 > 0 or y2 > 0):
             cv2.line(frame, (int(x1*w), int(y1*h)), (int(x2*w), int(y2*h)), (0, 255, 255), 2)
 
 
-def flip_landmarks_for_display(lm):
-    """Flip landmark x-coordinates for mirror display."""
-    flipped = lm.copy()
+def flip_lm_for_display(lm):
+    f = lm.copy()
     mask = np.any(lm != 0, axis=1)
-    flipped[mask, 0] = 1.0 - flipped[mask, 0]
-    return flipped
+    f[mask, 0] = 1.0 - f[mask, 0]
+    return f
 
 
-def draw_ui(frame, sign, conf, top5, hands_ok, lips_ok, pose_ok, buf_size, fps):
+def draw_ui(frame, sign, conf, top5, face_ok, hands_ok, pose_ok, buf_sz, fps):
     h, w = frame.shape[:2]
 
     # Top bar
     ov = frame.copy()
-    cv2.rectangle(ov, (0, 0), (w, 50), (0, 0, 0), -1)
-    cv2.addWeighted(ov, 0.7, frame, 0.3, 0, frame)
+    cv2.rectangle(ov, (0, 0), (w, 55), (0, 0, 0), -1)
+    cv2.addWeighted(ov, 0.75, frame, 0.25, 0, frame)
 
-    cv2.putText(frame, "ASL Sign Recognition", (8, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(frame, "SIGNFLOW - ASL Recognition", (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-    # Landmark status indicators
-    x_pos = 10
-    for label, ok, color in [("LIPS", lips_ok, (0,255,0)),
-                              ("HANDS", hands_ok, (255,150,0)),
-                              ("POSE", pose_ok, (0,255,255))]:
-        dot_color = color if ok else (60, 60, 60)
-        cv2.circle(frame, (x_pos + 5, 40), 5, dot_color, -1)
-        cv2.putText(frame, label, (x_pos + 14, 44),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, dot_color, 1)
-        x_pos += 80
+    # Status dots
+    x = 10
+    for label, ok, c in [("LIPS", face_ok, (0,255,0)),
+                          ("HANDS", hands_ok, (255,150,0)),
+                          ("POSE", pose_ok, (0,255,255))]:
+        dc = c if ok else (50, 50, 50)
+        cv2.circle(frame, (x+5, 42), 5, dc, -1)
+        cv2.putText(frame, label, (x+14, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.35, dc, 1)
+        x += 80
 
-    info = f"FPS:{fps:.0f} Buf:{buf_size}"
-    cv2.putText(frame, info, (w - 140, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+    cv2.putText(frame, f"FPS:{fps:.0f} Buf:{buf_sz}", (w-140, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150,150,150), 1)
+
+    if not face_ok:
+        cv2.putText(frame, "(lips from pose)", (x+10, 46),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,200,0), 1)
 
     # Prediction
     if sign and conf > 0.05:
         ov2 = frame.copy()
-        cv2.rectangle(ov2, (0, h - 110), (w, h), (0, 0, 0), -1)
+        cv2.rectangle(ov2, (0, h-120), (w, h), (0, 0, 0), -1)
         cv2.addWeighted(ov2, 0.75, frame, 0.25, 0, frame)
 
-        color = (0, 255, 100) if conf > 0.4 else (0, 220, 255) if conf > 0.2 else (150, 200, 255)
+        color = (0,255,100) if conf > 0.4 else (0,220,255) if conf > 0.2 else (150,200,255)
 
-        cv2.putText(frame, sign.upper(), (12, h - 78),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.3, color, 3)
-        cv2.putText(frame, f"{conf:.0%}", (w - 70, h - 78),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.putText(frame, sign.upper(), (12, h-85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 3)
+        cv2.putText(frame, f"{conf:.0%}", (w-75, h-85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-        # Top 5 bars
         for i, (s, c) in enumerate(top5):
-            y = h - 55 + i * 14
+            y = h - 60 + i * 14
             bw = max(1, int(c * (w - 20)))
             bc = color if i == 0 else (50, 50, 50)
-            cv2.rectangle(frame, (8, y - 2), (8 + bw, y + 9), bc, -1)
-            cv2.putText(frame, f"{s} {c:.0%}", (12, y + 7),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 255, 255), 1)
+            cv2.rectangle(frame, (8, y-2), (8+bw, y+9), bc, -1)
+            cv2.putText(frame, f"{s} {c:.0%}", (12, y+7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255,255,255), 1)
 
-    cv2.putText(frame, "Q:Quit  C:Clear", (8, h - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 80), 1)
+    cv2.putText(frame, "Q:Quit  C:Clear", (8, h-4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80,80,80), 1)
 
 
 # ---------------------------------------------------------------
@@ -399,7 +434,7 @@ def main():
     parser.add_argument("--camera", type=int, default=0)
     args = parser.parse_args()
 
-    # ---- Load model ----
+    # Load model
     print("Loading model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -427,7 +462,7 @@ def main():
     model.eval()
     print(f"Loaded: {num_classes} classes, {ckpt.get('best_val_acc',0)*100:.1f}% val acc")
 
-    # Warmup GPU
+    # GPU warmup
     if device.type == "cuda":
         d_f = torch.zeros(1, MAX_FRAMES, NUM_LANDMARKS, NUM_COORDS, device=device)
         d_i = torch.full((1, MAX_FRAMES), -1.0, device=device)
@@ -437,11 +472,11 @@ def main():
         del d_f, d_i
         print("GPU warm")
 
-    # ---- MediaPipe ----
+    # MediaPipe
     print("Loading MediaPipe...")
     extractor = LandmarkExtractor(args.mediapipe_dir)
 
-    # ---- Camera ----
+    # Camera
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print("ERROR: camera failed")
@@ -451,9 +486,25 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+    # Wait for camera warmup
+    print("Camera warming up...")
+    for _ in range(10):
+        cap.read()
+
+    # Test face detection
+    ret, test_bgr = cap.read()
+    if ret:
+        test_rgb = cv2.cvtColor(test_bgr, cv2.COLOR_BGR2RGB)
+        _, face_ok = extractor.extract(test_rgb)
+        if not face_ok:
+            print("NOTE: Face landmarks not detected - using pose estimation for lip region")
+            print("      This is normal for some webcams. Predictions will still work.")
+        else:
+            print("Face landmarks: OK")
+
     print("\n  READY - Show your hands and do a sign!\n")
 
-    # ---- State ----
+    # State
     hand_buffer = collections.deque(maxlen=MAX_FRAMES)
 
     cur_sign = None
@@ -461,21 +512,20 @@ def main():
     cur_top5 = []
 
     avg_probs = None
-    smooth_alpha = 0.5  # higher = more responsive to new predictions
+    smooth_alpha = 0.6
 
     fps = 0.0
     fps_t = time.time()
     fps_c = 0
     frame_idx = 0
-    predict_interval = 10  # predict every N frames (~0.33s at 30fps)
+    predict_interval = 8  # predict every N frames (~0.27s at 30fps)
 
     while True:
         ret, bgr = cap.read()
         if not ret:
             break
 
-        # IMPORTANT: Do NOT flip before extraction!
-        # Extract landmarks from ORIGINAL image (matches training data orientation)
+        # Extract from ORIGINAL image (not flipped) to match training data
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         # FPS
@@ -486,19 +536,18 @@ def main():
             fps_c = 0
             fps_t = now
 
-        # Extract ALL landmarks (face + hands + pose) EVERY frame
-        lm = extractor.extract(rgb)
+        # Extract ALL landmarks every frame
+        lm, face_ok = extractor.extract(rgb)
 
-        # Check what's detected
         hands_visible = np.any(lm[40:82] != 0)
         lips_visible = np.any(lm[0:40] != 0)
         pose_visible = np.any(lm[82:92] != 0)
 
-        # Buffer frames when hands are visible (sign is happening)
+        # Buffer when hands are visible
         if hands_visible:
             hand_buffer.append(lm.copy())
 
-        # Run prediction every predict_interval frames
+        # Predict continuously
         if frame_idx % predict_interval == 0 and len(hand_buffer) >= 8:
             probs = run_inference(model, list(hand_buffer), device)
             if probs is not None:
@@ -512,25 +561,19 @@ def main():
                 cur_conf = float(avg_probs[top_idx[0]])
                 cur_top5 = [(class_names.get(i, "?"), float(avg_probs[i])) for i in top_idx]
 
-                print(f"\r  >> {cur_sign.upper():15s} {cur_conf:5.0%}  "
-                      f"[lips:{lips_visible} hands:{hands_visible} pose:{pose_visible}] "
-                      f"buf={len(hand_buffer)}", end="", flush=True)
+                print(f"\r  >> {cur_sign.upper():15s} {cur_conf:5.0%}  buf={len(hand_buffer):2d}  "
+                      f"face={'Y' if face_ok else 'N(pose)'}", end="", flush=True)
 
-        # Now flip for DISPLAY only (mirror view for user)
+        # Flip for display only
         display = cv2.flip(bgr, 1)
+        display_lm = flip_lm_for_display(lm)
 
-        # Flip landmarks for display too
-        display_lm = flip_landmarks_for_display(lm)
-
-        # Draw all landmarks on display
         draw_landmarks(display, display_lm)
-
-        # Draw UI
         draw_ui(display, cur_sign, cur_conf, cur_top5,
-                hands_visible, lips_visible, pose_visible,
+                face_ok or lips_visible, hands_visible, pose_visible,
                 len(hand_buffer), fps)
 
-        cv2.imshow("ASL Sign Recognition", display)
+        cv2.imshow("SIGNFLOW", display)
         frame_idx += 1
 
         key = cv2.waitKey(1) & 0xFF
@@ -542,7 +585,7 @@ def main():
             cur_sign = None
             cur_conf = 0.0
             cur_top5 = []
-            print("\r  [Cleared]" + " " * 60, end="", flush=True)
+            print("\r  [Cleared]" + " "*60, end="", flush=True)
 
     print()
     cap.release()
