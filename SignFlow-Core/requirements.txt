@@ -1,5 +1,7 @@
 PyQt5==5.15.11
 mediapipe==0.10.14
+joblib==1.4.2
+scikit-learn==1.4.2
 numpy==1.26.4
 opencv-python==4.9.0.80
 torch>=2.0.0

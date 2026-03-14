@@ -1,10 +1,12 @@
 """
-Hand tracking and ASL sign prediction using the 3D Landmark Transformer.
+Hand tracking and ASL sign prediction for the SignFlow overlay.
 
-Uses MediaPipe Tasks API to extract 92 landmarks (40 lips + 21 LH + 21 RH + 10 pose)
-per frame, buffers them in a sliding window, and runs the transformer model for
-sequence-based sign prediction. The model was trained with lip dropout augmentation
-so it works even when face detection fails (common on webcams).
+Supports two models:
+- "Local Small" : sklearn model (model.pkl) using 21-landmark hand features (fast, alphabet-level)
+- "Local Medium": 3D Landmark Transformer (best_model.pth) using 92 landmarks (256 ASL signs)
+
+The screen capture feeds frames here. MediaPipe extracts landmarks. The selected
+model produces predictions displayed as captions in the overlay.
 """
 
 import collections
@@ -36,6 +38,12 @@ except Exception:
     cv2 = None
 
 try:
+    import joblib
+except Exception:
+    joblib = None
+
+# MediaPipe Tasks API (for both models)
+try:
     import mediapipe as mp_lib
     from mediapipe.tasks.python import BaseOptions
     from mediapipe.tasks.python.vision import (
@@ -44,8 +52,9 @@ try:
         PoseLandmarker, PoseLandmarkerOptions,
         RunningMode,
     )
+    _MP_TASKS_AVAILABLE = True
 except Exception:
-    mp_lib = None
+    _MP_TASKS_AVAILABLE = False
 
 from overlay_constants import (
     DETECTION_MAX_DIM,
@@ -55,15 +64,16 @@ from overlay_constants import (
 )
 
 # ---------------------------------------------------------------
-# Constants (must match training)
+# Constants
 # ---------------------------------------------------------------
+# Transformer model constants
 MAX_FRAMES = 64
 NUM_LANDMARKS = 92
 NUM_COORDS = 3
-PREDICT_INTERVAL = 4          # predict every N frames for speed
-SMOOTH_ALPHA = 0.6            # EMA smoothing for prediction probabilities
-MIN_BUFFER_FRAMES = 8         # minimum frames before predicting
-LANDMARK_BUFFER_SIZE = 64     # sliding window size
+PREDICT_INTERVAL = 4
+SMOOTH_ALPHA = 0.6
+MIN_BUFFER_FRAMES = 8
+LANDMARK_BUFFER_SIZE = 64
 
 LIPS_FACE_IDXS = np.array([
     61, 185, 40, 39, 37, 0, 267, 269, 270, 409,
@@ -81,138 +91,189 @@ HAND_CONNS = [
 ]
 
 
-# ---------------------------------------------------------------
-# Transformer Model (identical architecture to training)
-# ---------------------------------------------------------------
-class LandmarkEmbedding(nn.Module):
-    def __init__(self, in_features, units):
-        super().__init__()
-        self.empty_embedding = nn.Parameter(torch.zeros(units))
-        self.proj = nn.Sequential(
-            nn.Linear(in_features, units, bias=False),
-            nn.GELU(),
-            nn.Linear(units, units, bias=False),
-        )
-
-    def forward(self, x):
-        out = self.proj(x)
-        mask = (x.abs().sum(dim=-1, keepdim=True) == 0)
-        return torch.where(mask, self.empty_embedding, out)
+# ===============================================================
+# SKLEARN MODEL HELPERS ("Local Small" - model.pkl)
+# ===============================================================
+def normalize_landmarks(landmarks):
+    lm = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32)
+    base = lm[0]
+    lm = lm - base
+    scale = np.linalg.norm(lm[9]) if lm.shape[0] > 9 else 0.0
+    if scale < 1e-6:
+        scale = 1.0
+    return lm / scale
 
 
-class LandmarkTransformerEmbedding(nn.Module):
-    def __init__(self, max_frames, units, lips_units, hands_units, pose_units):
-        super().__init__()
-        self.positional_embedding = nn.Embedding(max_frames + 1, units)
-        nn.init.zeros_(self.positional_embedding.weight)
-        self.lips_embedding = LandmarkEmbedding(40 * 3, lips_units)
-        self.lh_embedding = LandmarkEmbedding(21 * 3, hands_units)
-        self.rh_embedding = LandmarkEmbedding(21 * 3, hands_units)
-        self.pose_embedding = LandmarkEmbedding(10 * 3, pose_units)
-        self.landmark_weights = nn.Parameter(torch.zeros(4))
-        self.fc = nn.Sequential(
-            nn.Linear(max(lips_units, hands_units, pose_units), units, bias=False),
-            nn.GELU(),
-            nn.Linear(units, units, bias=False),
-        )
-        self.max_frames = max_frames
-
-    def forward(self, frames, non_empty_frame_idxs):
-        x = frames
-        lips = x[:, :, 0:40, :].reshape(x.shape[0], x.shape[1], 40 * 3)
-        lh = x[:, :, 40:61, :].reshape(x.shape[0], x.shape[1], 21 * 3)
-        rh = x[:, :, 61:82, :].reshape(x.shape[0], x.shape[1], 21 * 3)
-        pose = x[:, :, 82:92, :].reshape(x.shape[0], x.shape[1], 10 * 3)
-        lips_emb = self.lips_embedding(lips)
-        lh_emb = self.lh_embedding(lh)
-        rh_emb = self.rh_embedding(rh)
-        pose_emb = self.pose_embedding(pose)
-        mu = max(lips_emb.shape[-1], lh_emb.shape[-1],
-                 rh_emb.shape[-1], pose_emb.shape[-1])
-        if lips_emb.shape[-1] < mu:
-            lips_emb = F.pad(lips_emb, (0, mu - lips_emb.shape[-1]))
-        if lh_emb.shape[-1] < mu:
-            lh_emb = F.pad(lh_emb, (0, mu - lh_emb.shape[-1]))
-        if rh_emb.shape[-1] < mu:
-            rh_emb = F.pad(rh_emb, (0, mu - rh_emb.shape[-1]))
-        if pose_emb.shape[-1] < mu:
-            pose_emb = F.pad(pose_emb, (0, mu - pose_emb.shape[-1]))
-        stacked = torch.stack([lips_emb, lh_emb, rh_emb, pose_emb], dim=-1)
-        weights = torch.softmax(self.landmark_weights, dim=0)
-        fused = (stacked * weights).sum(dim=-1)
-        fused = self.fc(fused)
-        max_idx = non_empty_frame_idxs.max(dim=1, keepdim=True).values.clamp(min=1)
-        pos_indices = torch.where(
-            non_empty_frame_idxs == -1.0,
-            torch.tensor(self.max_frames, device=frames.device, dtype=torch.long),
-            (non_empty_frame_idxs / max_idx * self.max_frames).long().clamp(0, self.max_frames - 1),
-        )
-        return fused + self.positional_embedding(pos_indices)
+def angle_at(a, b, c):
+    ba = a - b
+    bc = c - b
+    denom = np.linalg.norm(ba) * np.linalg.norm(bc)
+    if denom < 1e-6:
+        return 0.0
+    cos = float(np.dot(ba, bc) / denom)
+    cos = max(-1.0, min(1.0, cos))
+    return float(np.arccos(cos))
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, units, num_heads, mlp_ratio=4, dropout=0.1):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(units)
-        self.attn = nn.MultiheadAttention(units, num_heads, dropout=dropout, batch_first=True)
-        self.norm2 = nn.LayerNorm(units)
-        self.mlp = nn.Sequential(
-            nn.Linear(units, units * mlp_ratio), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(units * mlp_ratio, units), nn.Dropout(dropout),
-        )
-
-    def forward(self, x, key_padding_mask=None):
-        normed = self.norm1(x)
-        attn_out, _ = self.attn(normed, normed, normed, key_padding_mask=key_padding_mask)
-        x = x + attn_out
-        return x + self.mlp(self.norm2(x))
+def compute_angles(lm):
+    idx = lambda i: lm[i]
+    return [
+        angle_at(idx(1), idx(2), idx(3)),
+        angle_at(idx(2), idx(3), idx(4)),
+        angle_at(idx(5), idx(6), idx(7)),
+        angle_at(idx(6), idx(7), idx(8)),
+        angle_at(idx(9), idx(10), idx(11)),
+        angle_at(idx(10), idx(11), idx(12)),
+        angle_at(idx(13), idx(14), idx(15)),
+        angle_at(idx(14), idx(15), idx(16)),
+        angle_at(idx(17), idx(18), idx(19)),
+        angle_at(idx(18), idx(19), idx(20)),
+    ]
 
 
-class LandmarkTransformer(nn.Module):
-    def __init__(self, num_classes, max_frames=64, units=512, num_blocks=4,
-                 num_heads=8, mlp_ratio=4, dropout=0.2, emb_dropout=0.1,
-                 lips_units=384, hands_units=384, pose_units=256):
-        super().__init__()
-        self.embedding = LandmarkTransformerEmbedding(
-            max_frames, units, lips_units, hands_units, pose_units)
-        self.emb_dropout = nn.Dropout(emb_dropout)
-        self.blocks = nn.ModuleList([
-            TransformerBlock(units, num_heads, mlp_ratio, dropout)
-            for _ in range(num_blocks)])
-        self.norm = nn.LayerNorm(units)
-        self.head_dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(units, num_classes)
-        self._init_weights()
+def build_hand_features(landmarks):
+    norm = normalize_landmarks(landmarks)
+    coords = norm.flatten().tolist()
+    angles = compute_angles(norm)
+    return coords + angles
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
+
+def zero_hand_features():
+    return [0.0] * 73
+
+
+# ===============================================================
+# TRANSFORMER MODEL DEFINITIONS ("Local Medium" - best_model.pth)
+# ===============================================================
+if torch is not None and nn is not None:
+    class LandmarkEmbedding(nn.Module):
+        def __init__(self, in_features, units):
+            super().__init__()
+            self.empty_embedding = nn.Parameter(torch.zeros(units))
+            self.proj = nn.Sequential(
+                nn.Linear(in_features, units, bias=False),
+                nn.GELU(),
+                nn.Linear(units, units, bias=False),
+            )
+
+        def forward(self, x):
+            out = self.proj(x)
+            mask = (x.abs().sum(dim=-1, keepdim=True) == 0)
+            return torch.where(mask, self.empty_embedding, out)
+
+    class LandmarkTransformerEmbedding(nn.Module):
+        def __init__(self, max_frames, units, lips_units, hands_units, pose_units):
+            super().__init__()
+            self.positional_embedding = nn.Embedding(max_frames + 1, units)
+            nn.init.zeros_(self.positional_embedding.weight)
+            self.lips_embedding = LandmarkEmbedding(40 * 3, lips_units)
+            self.lh_embedding = LandmarkEmbedding(21 * 3, hands_units)
+            self.rh_embedding = LandmarkEmbedding(21 * 3, hands_units)
+            self.pose_embedding = LandmarkEmbedding(10 * 3, pose_units)
+            self.landmark_weights = nn.Parameter(torch.zeros(4))
+            self.fc = nn.Sequential(
+                nn.Linear(max(lips_units, hands_units, pose_units), units, bias=False),
+                nn.GELU(),
+                nn.Linear(units, units, bias=False),
+            )
+            self.max_frames = max_frames
+
+        def forward(self, frames, non_empty_frame_idxs):
+            x = frames
+            lips = x[:, :, 0:40, :].reshape(x.shape[0], x.shape[1], 40 * 3)
+            lh = x[:, :, 40:61, :].reshape(x.shape[0], x.shape[1], 21 * 3)
+            rh = x[:, :, 61:82, :].reshape(x.shape[0], x.shape[1], 21 * 3)
+            pose = x[:, :, 82:92, :].reshape(x.shape[0], x.shape[1], 10 * 3)
+            lips_emb = self.lips_embedding(lips)
+            lh_emb = self.lh_embedding(lh)
+            rh_emb = self.rh_embedding(rh)
+            pose_emb = self.pose_embedding(pose)
+            mu = max(lips_emb.shape[-1], lh_emb.shape[-1],
+                     rh_emb.shape[-1], pose_emb.shape[-1])
+            if lips_emb.shape[-1] < mu:
+                lips_emb = F.pad(lips_emb, (0, mu - lips_emb.shape[-1]))
+            if lh_emb.shape[-1] < mu:
+                lh_emb = F.pad(lh_emb, (0, mu - lh_emb.shape[-1]))
+            if rh_emb.shape[-1] < mu:
+                rh_emb = F.pad(rh_emb, (0, mu - rh_emb.shape[-1]))
+            if pose_emb.shape[-1] < mu:
+                pose_emb = F.pad(pose_emb, (0, mu - pose_emb.shape[-1]))
+            stacked = torch.stack([lips_emb, lh_emb, rh_emb, pose_emb], dim=-1)
+            weights = torch.softmax(self.landmark_weights, dim=0)
+            fused = (stacked * weights).sum(dim=-1)
+            fused = self.fc(fused)
+            max_idx = non_empty_frame_idxs.max(dim=1, keepdim=True).values.clamp(min=1)
+            pos_indices = torch.where(
+                non_empty_frame_idxs == -1.0,
+                torch.tensor(self.max_frames, device=frames.device, dtype=torch.long),
+                (non_empty_frame_idxs / max_idx * self.max_frames).long().clamp(0, self.max_frames - 1),
+            )
+            return fused + self.positional_embedding(pos_indices)
+
+    class TransformerBlock(nn.Module):
+        def __init__(self, units, num_heads, mlp_ratio=4, dropout=0.1):
+            super().__init__()
+            self.norm1 = nn.LayerNorm(units)
+            self.attn = nn.MultiheadAttention(units, num_heads, dropout=dropout, batch_first=True)
+            self.norm2 = nn.LayerNorm(units)
+            self.mlp = nn.Sequential(
+                nn.Linear(units, units * mlp_ratio), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(units * mlp_ratio, units), nn.Dropout(dropout),
+            )
+
+        def forward(self, x, key_padding_mask=None):
+            normed = self.norm1(x)
+            attn_out, _ = self.attn(normed, normed, normed, key_padding_mask=key_padding_mask)
+            x = x + attn_out
+            return x + self.mlp(self.norm2(x))
+
+    class LandmarkTransformer(nn.Module):
+        def __init__(self, num_classes, max_frames=64, units=512, num_blocks=4,
+                     num_heads=8, mlp_ratio=4, dropout=0.2, emb_dropout=0.1,
+                     lips_units=384, hands_units=384, pose_units=256):
+            super().__init__()
+            self.embedding = LandmarkTransformerEmbedding(
+                max_frames, units, lips_units, hands_units, pose_units)
+            self.emb_dropout = nn.Dropout(emb_dropout)
+            self.blocks = nn.ModuleList([
+                TransformerBlock(units, num_heads, mlp_ratio, dropout)
+                for _ in range(num_blocks)])
+            self.norm = nn.LayerNorm(units)
+            self.head_dropout = nn.Dropout(dropout)
+            self.classifier = nn.Linear(units, num_classes)
+            self._init_weights()
+
+        def _init_weights(self):
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.trunc_normal_(m.weight, std=0.02)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.LayerNorm):
+                    nn.init.ones_(m.weight)
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
 
-    def forward(self, frames, non_empty_frame_idxs):
-        x = self.embedding(frames, non_empty_frame_idxs)
-        x = self.emb_dropout(x)
-        kpm = (non_empty_frame_idxs == -1.0)
-        for block in self.blocks:
-            x = block(x, key_padding_mask=kpm)
-        x = self.norm(x)
-        mask = (~kpm).unsqueeze(-1).float()
-        denom = mask.sum(dim=1).clamp(min=1e-6)
-        x = (x * mask).sum(dim=1) / denom
-        x = self.head_dropout(x)
-        return self.classifier(x)
+        def forward(self, frames, non_empty_frame_idxs):
+            x = self.embedding(frames, non_empty_frame_idxs)
+            x = self.emb_dropout(x)
+            kpm = (non_empty_frame_idxs == -1.0)
+            for block in self.blocks:
+                x = block(x, key_padding_mask=kpm)
+            x = self.norm(x)
+            mask = (~kpm).unsqueeze(-1).float()
+            denom = mask.sum(dim=1).clamp(min=1e-6)
+            x = (x * mask).sum(dim=1) / denom
+            x = self.head_dropout(x)
+            return self.classifier(x)
+else:
+    LandmarkTransformer = None
 
 
-# ---------------------------------------------------------------
-# Landmark Extractor using MediaPipe Tasks API
-# ---------------------------------------------------------------
-class LandmarkExtractor:
-    """Extracts 92 landmarks (lips, hands, pose) using MediaPipe Tasks API."""
+# ===============================================================
+# MediaPipe Tasks Landmark Extractor (for transformer model)
+# ===============================================================
+class TasksLandmarkExtractor:
+    """Extracts 92 landmarks using MediaPipe Tasks API."""
 
     def __init__(self, model_dir):
         self.face_available = True
@@ -237,7 +298,7 @@ class LandmarkExtractor:
         ))
 
     def extract(self, rgb_array):
-        """Extract 92 landmarks from an RGB numpy array. Returns (landmarks, face_ok, hands_ok, pose_ok)."""
+        """Extract 92 landmarks. Returns (landmarks_92x3, face_ok, hands_ok, pose_ok)."""
         mp_img = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB,
                               data=np.ascontiguousarray(rgb_array))
         lm = np.zeros((NUM_LANDMARKS, NUM_COORDS), dtype=np.float32)
@@ -283,10 +344,9 @@ class LandmarkExtractor:
 
 
 # ---------------------------------------------------------------
-# Drawing utilities
+# Drawing
 # ---------------------------------------------------------------
-def _draw_hand(image, lm, offset, color, w, h):
-    """Draw hand landmarks and connections on image."""
+def _draw_hand_lm(image, lm, offset, color, w, h):
     for i in range(21):
         x, y = lm[offset + i, 0], lm[offset + i, 1]
         if x > 0 or y > 0:
@@ -299,21 +359,17 @@ def _draw_hand(image, lm, offset, color, w, h):
                      (int(x2 * w), int(y2 * h)), color, 2)
 
 
-def draw_landmarks_on_image(image, lm):
-    """Draw all 92 landmarks on an image (BGR)."""
+def draw_92_landmarks(image, lm):
+    """Draw all 92 landmarks on a BGR image."""
     if cv2 is None:
         return
     h, w = image.shape[:2]
-    # Lips - green
     for i in range(40):
         x, y = lm[i, 0], lm[i, 1]
         if x > 0 or y > 0:
             cv2.circle(image, (int(x * w), int(y * h)), 2, (0, 255, 0), -1)
-    # Left hand - blue
-    _draw_hand(image, lm, 40, (255, 150, 0), w, h)
-    # Right hand - orange
-    _draw_hand(image, lm, 61, (0, 130, 255), w, h)
-    # Pose - yellow
+    _draw_hand_lm(image, lm, 40, (255, 150, 0), w, h)
+    _draw_hand_lm(image, lm, 61, (0, 130, 255), w, h)
     for i in range(82, 92):
         x, y = lm[i, 0], lm[i, 1]
         if x > 0 or y > 0:
@@ -321,31 +377,24 @@ def draw_landmarks_on_image(image, lm):
 
 
 # ---------------------------------------------------------------
-# Model inference
+# Transformer inference
 # ---------------------------------------------------------------
 def run_transformer_inference(model, frames_list, device):
-    """Run the transformer on a list of landmark frames. Returns probability array or None."""
     n = len(frames_list)
     if n < MIN_BUFFER_FRAMES:
         return None
-
     if n > MAX_FRAMES:
         indices = np.linspace(0, n - 1, MAX_FRAMES, dtype=int)
         frames_list = [frames_list[i] for i in indices]
         n = MAX_FRAMES
-
     arr = np.stack(frames_list, axis=0).astype(np.float32)
-
     if n < MAX_FRAMES:
         pad = np.zeros((MAX_FRAMES - n, NUM_LANDMARKS, NUM_COORDS), dtype=np.float32)
         arr = np.concatenate([arr, pad], axis=0)
-
     non_empty = np.any(arr != 0, axis=(1, 2))
     ne_idxs = np.where(non_empty, np.arange(MAX_FRAMES, dtype=np.float32), -1.0)
-
     frames_t = torch.from_numpy(arr).unsqueeze(0).to(device)
     idxs_t = torch.from_numpy(ne_idxs).unsqueeze(0).to(device)
-
     with torch.no_grad():
         if device.type == "cuda":
             with torch.amp.autocast("cuda"):
@@ -355,16 +404,23 @@ def run_transformer_inference(model, frames_list, device):
         return torch.softmax(logits, dim=1)[0].cpu().numpy()
 
 
-# ---------------------------------------------------------------
-# HandTracker - main tracking + prediction class
-# ---------------------------------------------------------------
+# ===============================================================
+# HandTracker - supports BOTH models
+# ===============================================================
 class HandTracker:
     def __init__(self):
-        self.available = (mp_lib is not None and torch is not None)
-        self._model = None
-        self._device = None
-        self._class_names = {}
-        self._extractor = None
+        self.available = _MP_TASKS_AVAILABLE
+        self._active_model = "Local Small"  # current model selection
+
+        # --- sklearn model (Local Small) ---
+        self._sklearn_model = None
+        self._sklearn_hand_lm = None  # Tasks API HandLandmarker for sklearn
+
+        # --- transformer model (Local Medium) ---
+        self._transformer_model = None
+        self._transformer_device = None
+        self._transformer_class_names = {}
+        self._tasks_extractor = None
         self._landmark_buffer = collections.deque(maxlen=LANDMARK_BUFFER_SIZE)
         self._avg_probs = None
         self._frame_count = 0
@@ -380,62 +436,245 @@ class HandTracker:
         if not self.available:
             return
 
-        # Load transformer model
-        model_dir = Path(__file__).resolve().parent / "models"
-        model_path = model_dir / "best_model.pth"
-        class_map_path = model_dir / "class_map.json"
-
-        if model_path.exists():
-            try:
-                self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                ckpt = torch.load(str(model_path), map_location=self._device, weights_only=False)
-                config = ckpt.get("config", {})
-                num_classes = ckpt.get("num_classes", 256)
-
-                if class_map_path.exists():
-                    with open(class_map_path) as f:
-                        self._class_names = {int(k): v for k, v in json.load(f).items()}
-                else:
-                    self._class_names = {i: n for i, n in enumerate(ckpt.get("class_names", []))}
-
-                self._model = LandmarkTransformer(
-                    num_classes=num_classes,
-                    max_frames=config.get("max_frames", MAX_FRAMES),
-                    units=config.get("units", 512),
-                    num_blocks=config.get("num_blocks", 4),
-                    num_heads=config.get("num_heads", 8),
-                    dropout=config.get("dropout", 0.15),
-                ).to(self._device)
-                self._model.load_state_dict(ckpt["model_state_dict"])
-                self._model.eval()
-
-                # GPU warmup
-                if self._device.type == "cuda":
-                    d_f = torch.zeros(1, MAX_FRAMES, NUM_LANDMARKS, NUM_COORDS, device=self._device)
-                    d_i = torch.full((1, MAX_FRAMES), -1.0, device=self._device)
-                    d_i[0, 0] = 0.0
-                    with torch.no_grad(), torch.amp.autocast("cuda"):
-                        self._model(d_f, d_i)
-                    del d_f, d_i
-
-            except Exception as e:
-                print(f"[SignFlow] Model load error: {e}")
-                self._model = None
-
-        # Initialize MediaPipe landmark extractor
         mp_model_dir = Path(__file__).resolve().parent / "mediapipe_models"
+
+        # --- Load sklearn model ---
+        if joblib is not None:
+            model_path = Path(__file__).resolve().parent / "models" / "model.pkl"
+            if model_path.exists():
+                try:
+                    self._sklearn_model = joblib.load(os.fspath(model_path))
+                except Exception:
+                    self._sklearn_model = None
+
+        # --- Init MediaPipe Tasks HandLandmarker for sklearn model ---
         if mp_model_dir.exists():
-            try:
-                self._extractor = LandmarkExtractor(str(mp_model_dir))
-            except Exception as e:
-                print(f"[SignFlow] MediaPipe init error: {e}")
-                self._extractor = None
-        else:
-            self._extractor = None
+            hand_task = str(mp_model_dir / "hand_landmarker.task")
+            if os.path.exists(hand_task):
+                try:
+                    self._sklearn_hand_lm = HandLandmarker.create_from_options(
+                        HandLandmarkerOptions(
+                            base_options=BaseOptions(model_asset_path=hand_task),
+                            running_mode=RunningMode.IMAGE,
+                            num_hands=2,
+                            min_hand_detection_confidence=0.5,
+                            min_hand_presence_confidence=0.5,
+                        ))
+                except Exception:
+                    self._sklearn_hand_lm = None
+
+        # --- Load transformer model ---
+        if torch is not None and LandmarkTransformer is not None:
+            model_dir = Path(__file__).resolve().parent / "models"
+            model_path = model_dir / "best_model.pth"
+            class_map_path = model_dir / "class_map.json"
+
+            if model_path.exists():
+                try:
+                    self._transformer_device = torch.device(
+                        "cuda" if torch.cuda.is_available() else "cpu")
+                    ckpt = torch.load(str(model_path),
+                                      map_location=self._transformer_device,
+                                      weights_only=False)
+                    config = ckpt.get("config", {})
+                    num_classes = ckpt.get("num_classes", 256)
+
+                    if class_map_path.exists():
+                        with open(class_map_path) as f:
+                            self._transformer_class_names = {
+                                int(k): v for k, v in json.load(f).items()}
+                    else:
+                        self._transformer_class_names = {
+                            i: n for i, n in enumerate(ckpt.get("class_names", []))}
+
+                    self._transformer_model = LandmarkTransformer(
+                        num_classes=num_classes,
+                        max_frames=config.get("max_frames", MAX_FRAMES),
+                        units=config.get("units", 512),
+                        num_blocks=config.get("num_blocks", 4),
+                        num_heads=config.get("num_heads", 8),
+                        dropout=config.get("dropout", 0.15),
+                    ).to(self._transformer_device)
+                    self._transformer_model.load_state_dict(ckpt["model_state_dict"])
+                    self._transformer_model.eval()
+
+                    # GPU warmup
+                    if self._transformer_device.type == "cuda":
+                        d_f = torch.zeros(1, MAX_FRAMES, NUM_LANDMARKS, NUM_COORDS,
+                                          device=self._transformer_device)
+                        d_i = torch.full((1, MAX_FRAMES), -1.0,
+                                         device=self._transformer_device)
+                        d_i[0, 0] = 0.0
+                        with torch.no_grad(), torch.amp.autocast("cuda"):
+                            self._transformer_model(d_f, d_i)
+                        del d_f, d_i
+                except Exception as e:
+                    print(f"[SignFlow] Transformer model load error: {e}")
+                    self._transformer_model = None
+
+        # --- Init MediaPipe Tasks (for transformer model) ---
+        if _MP_TASKS_AVAILABLE:
+            mp_model_dir = Path(__file__).resolve().parent / "mediapipe_models"
+            if mp_model_dir.exists():
+                try:
+                    self._tasks_extractor = TasksLandmarkExtractor(str(mp_model_dir))
+                except Exception as e:
+                    print(f"[SignFlow] MediaPipe Tasks init error: {e}")
+
+    def set_model(self, model_name: str):
+        """Switch active model. Called when user changes dropdown."""
+        self._active_model = model_name
+        # Reset transformer state when switching
+        self._landmark_buffer.clear()
+        self._avg_probs = None
+        self._frame_count = 0
 
     def process(self, frame: dict, flip_horizontal: bool = False):
-        """Process a frame: extract landmarks, buffer, predict. Returns (annotated_frame, status)."""
-        if not self.available or frame is None or self._extractor is None:
+        """Process a captured frame. Route to the active model."""
+        if not self.available or frame is None:
+            return frame, self.last_status
+
+        if self._active_model == "Local Medium":
+            return self._process_transformer(frame, flip_horizontal)
+        else:
+            return self._process_sklearn(frame, flip_horizontal)
+
+    # -----------------------------------------------------------
+    # SKLEARN path ("Local Small")
+    # -----------------------------------------------------------
+    def _process_sklearn(self, frame: dict, flip_horizontal: bool = False):
+        if self._sklearn_hand_lm is None:
+            return frame, self.last_status
+
+        rgb = frame.get("rgb")
+        width = int(frame.get("width", 0) or 0)
+        height = int(frame.get("height", 0) or 0)
+        if rgb is None or width <= 0 or height <= 0:
+            return frame, self.last_status
+
+        start_time = time.perf_counter()
+        image = np.frombuffer(rgb, dtype=np.uint8).reshape(height, width, 3).copy()
+        if flip_horizontal:
+            image = image[:, ::-1, :].copy()
+
+        # Detect hands using Tasks API
+        mp_img = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB,
+                              data=np.ascontiguousarray(image))
+        hr = self._sklearn_hand_lm.detect(mp_img)
+
+        left_features = None
+        right_features = None
+        left_conf = 0.0
+        right_conf = 0.0
+        unknown_features = []
+        prediction_text = "No Hand"
+        prediction_conf = 0.0
+        label = None
+        hands_detected = 0
+
+        if hr.hand_landmarks:
+            hands_detected = len(hr.hand_landmarks)
+            h, w = image.shape[:2]
+
+            for hi, hand_lms in enumerate(hr.hand_landmarks):
+                if hi >= 2:
+                    break
+
+                # Draw landmarks on image
+                if cv2 is not None:
+                    for i in range(min(21, len(hand_lms))):
+                        px = int(hand_lms[i].x * w)
+                        py = int(hand_lms[i].y * h)
+                        cv2.circle(image, (px, py), 3, (0, 255, 0), -1)
+                    for a, b in HAND_CONNS:
+                        if a < len(hand_lms) and b < len(hand_lms):
+                            p1 = (int(hand_lms[a].x * w), int(hand_lms[a].y * h))
+                            p2 = (int(hand_lms[b].x * w), int(hand_lms[b].y * h))
+                            cv2.line(image, p1, p2, (0, 255, 0), 2)
+
+                # Build features - create landmark-like objects for build_hand_features
+                class _LM:
+                    __slots__ = ('x', 'y', 'z')
+                    def __init__(self, x, y, z):
+                        self.x = x
+                        self.y = y
+                        self.z = z
+
+                lm_list = [_LM(l.x, l.y, l.z) for l in hand_lms[:21]]
+                features = build_hand_features(lm_list)
+
+                # Get handedness
+                score = 0.0
+                hand_label = None
+                if hr.handedness and hi < len(hr.handedness):
+                    cat = hr.handedness[hi]
+                    if cat:
+                        hand_label = cat[0].category_name
+                        score = float(cat[0].score)
+
+                if hand_label == "Right":
+                    right_features = features
+                    right_conf = score
+                    label = "Right"
+                elif hand_label == "Left":
+                    left_features = features
+                    left_conf = score
+                    label = "Left"
+                else:
+                    unknown_features.append((features, score))
+
+            if right_features is None and unknown_features:
+                right_features, right_conf = unknown_features.pop(0)
+            if left_features is None and unknown_features:
+                left_features, left_conf = unknown_features.pop(0)
+
+            # Build combined feature vector and predict
+            primary = right_features if right_features is not None else zero_hand_features()
+            secondary = left_features if left_features is not None else zero_hand_features()
+            only_primary = 1 if right_features is not None and left_features is None else 0
+            combined = [only_primary] + primary + secondary
+
+            if self._sklearn_model is not None:
+                features_arr = np.array(combined, dtype=np.float32).reshape(1, -1)
+                probs = self._sklearn_model.predict_proba(features_arr)[0]
+                prediction_conf = float(np.max(probs))
+                if prediction_conf >= SIGN_PREDICTION_MIN_CONFIDENCE:
+                    prediction_text = self._sklearn_model.predict(features_arr)[0]
+                else:
+                    prediction_text = "Uncertain"
+            else:
+                prediction_text = "No Model"
+
+        processing_ms = (time.perf_counter() - start_time) * 1000.0
+
+        self.last_status = {
+            "hands_detected": hands_detected,
+            "left_conf": left_conf,
+            "right_conf": right_conf,
+            "prediction": prediction_text,
+            "prediction_conf": prediction_conf,
+            "input_w": width,
+            "input_h": height,
+            "det_w": width,
+            "det_h": height,
+            "det_scale": 1.0,
+            "pad_x": 0,
+            "pad_y": 0,
+            "flip": bool(flip_horizontal),
+            "model_loaded": self._sklearn_model is not None,
+            "hand_label": label or "Unknown",
+            "processing_ms": processing_ms,
+        }
+
+        out_frame = dict(frame)
+        out_frame["rgb"] = image.tobytes()
+        return out_frame, self.last_status
+
+    # -----------------------------------------------------------
+    # TRANSFORMER path ("Local Medium")
+    # -----------------------------------------------------------
+    def _process_transformer(self, frame: dict, flip_horizontal: bool = False):
+        if self._tasks_extractor is None:
             return frame, self.last_status
 
         rgb = frame.get("rgb")
@@ -447,75 +686,68 @@ class HandTracker:
         start_time = time.perf_counter()
         image = np.frombuffer(rgb, dtype=np.uint8).reshape(height, width, 3).copy()
 
-        # Extract from ORIGINAL image (not flipped) to match training data
+        # For screen capture: the frame is already in the right orientation.
+        # flip_horizontal is for display mirroring of webcam-like feeds.
+        # Extract landmarks from the un-flipped image.
         if flip_horizontal:
-            # The overlay captures screen (already correct orientation)
-            # We extract landmarks from the original, then flip for display
             extract_image = image[:, ::-1, :].copy()
         else:
             extract_image = image
 
-        # Extract all 92 landmarks
-        lm, face_ok, hands_ok, pose_ok = self._extractor.extract(extract_image)
+        lm, face_ok, hands_ok, pose_ok = self._tasks_extractor.extract(extract_image)
 
-        # Draw landmarks on image for display
+        # Draw landmarks on the display image
         if cv2 is not None:
             if flip_horizontal:
-                # Flip landmark x-coordinates for display on the flipped image
                 display_lm = lm.copy()
                 mask = np.any(lm != 0, axis=1)
                 display_lm[mask, 0] = 1.0 - display_lm[mask, 0]
-                draw_landmarks_on_image(image, display_lm)
+                draw_92_landmarks(image, display_lm)
             else:
-                draw_landmarks_on_image(image, lm)
+                draw_92_landmarks(image, lm)
 
-        # Buffer landmarks when hands are visible
         hands_visible = np.any(lm[40:82] != 0)
         if hands_visible:
             self._landmark_buffer.append(lm.copy())
 
-        # Predict
         prediction_text = "No Hand"
         prediction_conf = 0.0
-        hands_detected = 1 if hands_visible else 0
         self._frame_count += 1
 
-        if self._frame_count % PREDICT_INTERVAL == 0 and len(self._landmark_buffer) >= MIN_BUFFER_FRAMES:
-            if self._model is not None:
-                probs = run_transformer_inference(
-                    self._model, list(self._landmark_buffer), self._device)
-                if probs is not None:
-                    if self._avg_probs is None:
-                        self._avg_probs = probs
-                    else:
-                        self._avg_probs = SMOOTH_ALPHA * probs + (1 - SMOOTH_ALPHA) * self._avg_probs
-
-                    top_idx = int(np.argmax(self._avg_probs))
-                    prediction_conf = float(self._avg_probs[top_idx])
-
-                    if prediction_conf >= SIGN_PREDICTION_MIN_CONFIDENCE:
-                        prediction_text = self._class_names.get(top_idx, str(top_idx))
-                    else:
-                        prediction_text = "Uncertain"
-            else:
-                prediction_text = "No Model"
+        if (self._frame_count % PREDICT_INTERVAL == 0
+                and len(self._landmark_buffer) >= MIN_BUFFER_FRAMES
+                and self._transformer_model is not None):
+            probs = run_transformer_inference(
+                self._transformer_model, list(self._landmark_buffer),
+                self._transformer_device)
+            if probs is not None:
+                if self._avg_probs is None:
+                    self._avg_probs = probs
+                else:
+                    self._avg_probs = SMOOTH_ALPHA * probs + (1 - SMOOTH_ALPHA) * self._avg_probs
+                top_idx = int(np.argmax(self._avg_probs))
+                prediction_conf = float(self._avg_probs[top_idx])
+                if prediction_conf >= SIGN_PREDICTION_MIN_CONFIDENCE:
+                    prediction_text = self._transformer_class_names.get(top_idx, str(top_idx))
+                else:
+                    prediction_text = "Uncertain"
         elif self._avg_probs is not None:
-            # Use last prediction between inference cycles
             top_idx = int(np.argmax(self._avg_probs))
             prediction_conf = float(self._avg_probs[top_idx])
             if prediction_conf >= SIGN_PREDICTION_MIN_CONFIDENCE:
-                prediction_text = self._class_names.get(top_idx, str(top_idx))
+                prediction_text = self._transformer_class_names.get(top_idx, str(top_idx))
             elif hands_visible:
                 prediction_text = "Uncertain"
+        elif self._transformer_model is None:
+            prediction_text = "No Model"
 
         if not hands_visible and self._avg_probs is None:
             prediction_text = "No Hand"
 
-        processing_ms = (time.perf_counter() - start_time) * 1000.0
-
-        # Compute hand confidences from landmarks
         lh_conf = 1.0 if np.any(lm[40:61] != 0) else 0.0
         rh_conf = 1.0 if np.any(lm[61:82] != 0) else 0.0
+        hands_detected = int(lh_conf > 0) + int(rh_conf > 0)
+        processing_ms = (time.perf_counter() - start_time) * 1000.0
 
         self.last_status = {
             "hands_detected": hands_detected,
@@ -531,8 +763,11 @@ class HandTracker:
             "pad_x": 0,
             "pad_y": 0,
             "flip": bool(flip_horizontal),
-            "model_loaded": self._model is not None,
-            "hand_label": "Both" if (lh_conf > 0 and rh_conf > 0) else ("Left" if lh_conf > 0 else ("Right" if rh_conf > 0 else "None")),
+            "model_loaded": self._transformer_model is not None,
+            "hand_label": ("Both" if (lh_conf > 0 and rh_conf > 0)
+                           else "Left" if lh_conf > 0
+                           else "Right" if rh_conf > 0
+                           else "None"),
             "processing_ms": processing_ms,
             "face_ok": face_ok,
             "pose_ok": pose_ok,
@@ -544,10 +779,15 @@ class HandTracker:
         return out_frame, self.last_status
 
     def close(self):
-        if self._extractor is not None:
-            self._extractor.close()
+        if self._tasks_extractor is not None:
+            self._tasks_extractor.close()
+        if self._sklearn_hand_lm is not None:
+            self._sklearn_hand_lm.close()
 
 
+# ===============================================================
+# Worker thread
+# ===============================================================
 class HandTrackingWorker(QThread):
     status_updated = pyqtSignal(dict)
     frame_processed = pyqtSignal(object)
@@ -568,6 +808,10 @@ class HandTrackingWorker(QThread):
     @property
     def available(self):
         return self._tracker.available
+
+    def set_model(self, model_name: str):
+        """Switch the active model (called from UI thread)."""
+        self._tracker.set_model(model_name)
 
     def submit(self, frame: dict):
         if not self.available or frame is None:

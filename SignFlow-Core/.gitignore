@@ -17,6 +17,5 @@ dist/
 # User preferences
 user_preferences.json
 
-# Old sklearn models (replaced by transformer)
-models/model.pkl
+# Legacy duplicate model
 models/model___.pkl
