@@ -1,16 +1,10 @@
 """
-Real-time ASL Sign Language Recognition from Webcam.
+Real-time ASL Sign Language Recognition - Live Continuous Prediction.
 
-Uses MediaPipe Tasks API for landmark extraction and a trained
-3D Landmark Transformer for sign classification (256 classes).
+Shows hands -> instant prediction. No buttons, no recording, no waiting.
+Predicts continuously every 0.5 seconds on the last ~2 seconds of frames.
 
-Runs continuous prediction with a sliding window - no button pressing needed.
-Just perform a sign in front of the camera and see the result.
-
-Controls:
-  Q - Quit
-  C - Clear current prediction
-  SPACE - Force predict now on current buffer
+Controls:  Q = Quit  |  C = Clear
 
 Usage:
   python sign_inference.py
@@ -23,7 +17,6 @@ import json
 import os
 import sys
 import time
-import threading
 
 import cv2
 import numpy as np
@@ -56,18 +49,15 @@ LIPS_FACE_IDXS = np.array([
 
 POSE_UPPER_IDXS = np.array([0, 11, 12, 13, 14, 15, 16, 23, 24, 25], dtype=np.int32)
 
-HAND_CONNECTIONS = [
-    (0,1),(1,2),(2,3),(3,4),
-    (0,5),(5,6),(6,7),(7,8),
-    (0,9),(9,10),(10,11),(11,12),
-    (0,13),(13,14),(14,15),(15,16),
-    (0,17),(17,18),(18,19),(19,20),
-    (5,9),(9,13),(13,17),
+HAND_CONNS = [
+    (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
+    (0,9),(9,10),(10,11),(11,12),(0,13),(13,14),(14,15),(15,16),
+    (0,17),(17,18),(18,19),(19,20),(5,9),(9,13),(13,17),
 ]
 
 
 # ---------------------------------------------------------------
-# Model architecture (identical to train_landmark_transformer.py)
+# Model (identical to training script)
 # ---------------------------------------------------------------
 class LandmarkEmbedding(nn.Module):
     def __init__(self, in_features, units):
@@ -82,8 +72,7 @@ class LandmarkEmbedding(nn.Module):
     def forward(self, x):
         out = self.proj(x)
         mask = (x.abs().sum(dim=-1, keepdim=True) == 0)
-        out = torch.where(mask, self.empty_embedding, out)
-        return out
+        return torch.where(mask, self.empty_embedding, out)
 
 
 class LandmarkTransformerEmbedding(nn.Module):
@@ -113,16 +102,16 @@ class LandmarkTransformerEmbedding(nn.Module):
         lh_emb = self.lh_embedding(lh)
         rh_emb = self.rh_embedding(rh)
         pose_emb = self.pose_embedding(pose)
-        max_units = max(lips_emb.shape[-1], lh_emb.shape[-1],
-                        rh_emb.shape[-1], pose_emb.shape[-1])
-        if lips_emb.shape[-1] < max_units:
-            lips_emb = F.pad(lips_emb, (0, max_units - lips_emb.shape[-1]))
-        if lh_emb.shape[-1] < max_units:
-            lh_emb = F.pad(lh_emb, (0, max_units - lh_emb.shape[-1]))
-        if rh_emb.shape[-1] < max_units:
-            rh_emb = F.pad(rh_emb, (0, max_units - rh_emb.shape[-1]))
-        if pose_emb.shape[-1] < max_units:
-            pose_emb = F.pad(pose_emb, (0, max_units - pose_emb.shape[-1]))
+        mu = max(lips_emb.shape[-1], lh_emb.shape[-1],
+                 rh_emb.shape[-1], pose_emb.shape[-1])
+        if lips_emb.shape[-1] < mu:
+            lips_emb = F.pad(lips_emb, (0, mu - lips_emb.shape[-1]))
+        if lh_emb.shape[-1] < mu:
+            lh_emb = F.pad(lh_emb, (0, mu - lh_emb.shape[-1]))
+        if rh_emb.shape[-1] < mu:
+            rh_emb = F.pad(rh_emb, (0, mu - rh_emb.shape[-1]))
+        if pose_emb.shape[-1] < mu:
+            pose_emb = F.pad(pose_emb, (0, mu - pose_emb.shape[-1]))
         stacked = torch.stack([lips_emb, lh_emb, rh_emb, pose_emb], dim=-1)
         weights = torch.softmax(self.landmark_weights, dim=0)
         fused = (stacked * weights).sum(dim=-1)
@@ -133,8 +122,7 @@ class LandmarkTransformerEmbedding(nn.Module):
             torch.tensor(self.max_frames, device=frames.device, dtype=torch.long),
             (non_empty_frame_idxs / max_idx * self.max_frames).long().clamp(0, self.max_frames - 1),
         )
-        fused = fused + self.positional_embedding(pos_indices)
-        return fused
+        return fused + self.positional_embedding(pos_indices)
 
 
 class TransformerBlock(nn.Module):
@@ -144,19 +132,15 @@ class TransformerBlock(nn.Module):
         self.attn = nn.MultiheadAttention(units, num_heads, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(units)
         self.mlp = nn.Sequential(
-            nn.Linear(units, units * mlp_ratio),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(units * mlp_ratio, units),
-            nn.Dropout(dropout),
+            nn.Linear(units, units * mlp_ratio), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(units * mlp_ratio, units), nn.Dropout(dropout),
         )
 
     def forward(self, x, key_padding_mask=None):
         normed = self.norm1(x)
         attn_out, _ = self.attn(normed, normed, normed, key_padding_mask=key_padding_mask)
         x = x + attn_out
-        x = x + self.mlp(self.norm2(x))
-        return x
+        return x + self.mlp(self.norm2(x))
 
 
 class LandmarkTransformer(nn.Module):
@@ -188,11 +172,11 @@ class LandmarkTransformer(nn.Module):
     def forward(self, frames, non_empty_frame_idxs):
         x = self.embedding(frames, non_empty_frame_idxs)
         x = self.emb_dropout(x)
-        key_padding_mask = (non_empty_frame_idxs == -1.0)
+        kpm = (non_empty_frame_idxs == -1.0)
         for block in self.blocks:
-            x = block(x, key_padding_mask=key_padding_mask)
+            x = block(x, key_padding_mask=kpm)
         x = self.norm(x)
-        mask = (~key_padding_mask).unsqueeze(-1).float()
+        mask = (~kpm).unsqueeze(-1).float()
         denom = mask.sum(dim=1).clamp(min=1e-6)
         x = (x * mask).sum(dim=1) / denom
         x = self.head_dropout(x)
@@ -200,7 +184,7 @@ class LandmarkTransformer(nn.Module):
 
 
 # ---------------------------------------------------------------
-# Landmark extraction (optimized for real-time)
+# Fast landmark extraction
 # ---------------------------------------------------------------
 class LandmarkExtractor:
     def __init__(self, model_dir):
@@ -219,10 +203,11 @@ class LandmarkExtractor:
             running_mode=RunningMode.IMAGE, num_poses=1,
             min_pose_detection_confidence=0.25, min_pose_presence_confidence=0.25,
         ))
-        self._last_lm = np.zeros((NUM_LANDMARKS, NUM_COORDS), dtype=np.float32)
+        self._cached_face_pose = np.zeros((NUM_LANDMARKS, NUM_COORDS), dtype=np.float32)
 
-    def extract(self, rgb_frame):
-        mp_img = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB, data=rgb_frame)
+    def extract_all(self, rgb):
+        """Full extraction: face + hands + pose."""
+        mp_img = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB, data=rgb)
         lm = np.zeros((NUM_LANDMARKS, NUM_COORDS), dtype=np.float32)
 
         fr = self.face_lm.detect(mp_img)
@@ -249,16 +234,17 @@ class LandmarkExtractor:
                 if pidx < len(pose):
                     lm[82 + k] = [pose[pidx].x, pose[pidx].y, pose[pidx].z]
 
-        self._last_lm = lm
+        # Cache face+pose for fast frames
+        self._cached_face_pose[:40] = lm[:40]
+        self._cached_face_pose[82:] = lm[82:]
         return lm
 
-    def extract_hands_only(self, rgb_frame):
-        """Fast path: only detect hands (skip face/pose for speed)."""
-        mp_img = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB, data=rgb_frame)
-        lm = self._last_lm.copy()  # reuse last face+pose
-
-        # Clear hands and re-detect
+    def extract_hands_fast(self, rgb):
+        """Fast path: only hands (reuse cached face+pose)."""
+        mp_img = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB, data=rgb)
+        lm = self._cached_face_pose.copy()
         lm[40:82] = 0
+
         hr = self.hand_lm.detect(mp_img)
         if hr.hand_landmarks:
             for hi, (hm, hn) in enumerate(zip(hr.hand_landmarks, hr.handedness)):
@@ -268,8 +254,6 @@ class LandmarkExtractor:
                 offset = 40 if label == "left" else 61
                 for j in range(min(21, len(hm))):
                     lm[offset + j] = [hm[j].x, hm[j].y, hm[j].z]
-
-        self._last_lm = lm
         return lm
 
     def close(self):
@@ -279,309 +263,110 @@ class LandmarkExtractor:
 
 
 # ---------------------------------------------------------------
-# Sign state machine - detects sign boundaries
-# ---------------------------------------------------------------
-class SignDetector:
-    """Detects when a sign starts and ends based on hand motion."""
-
-    def __init__(self):
-        self.state = "idle"  # idle -> signing -> cooldown -> idle
-        self.frames = []
-        self.no_hand_count = 0
-        self.hand_count = 0
-        self.prev_hand_center = None
-        self.motion_energy = 0.0
-        self.still_count = 0
-
-    def _hand_center(self, landmarks):
-        """Get average hand position from landmarks."""
-        hands = landmarks[40:82]  # both hands
-        nonzero = hands[np.any(hands != 0, axis=1)]
-        if len(nonzero) == 0:
-            return None
-        return nonzero[:, :2].mean(axis=0)
-
-    def _has_hands(self, landmarks):
-        return np.any(landmarks[40:82] != 0)
-
-    def update(self, landmarks):
-        """Update state machine. Returns (event, frames) where event is
-        None, 'recording', or 'predict'."""
-        has_hands = self._has_hands(landmarks)
-        center = self._hand_center(landmarks)
-
-        # Compute motion
-        if center is not None and self.prev_hand_center is not None:
-            motion = np.linalg.norm(center - self.prev_hand_center)
-            self.motion_energy = 0.7 * self.motion_energy + 0.3 * motion
-        else:
-            self.motion_energy *= 0.8
-        self.prev_hand_center = center
-
-        if self.state == "idle":
-            if has_hands:
-                self.hand_count += 1
-                if self.hand_count >= 3:  # hands visible for 3 frames
-                    self.state = "signing"
-                    self.frames = []
-                    self.still_count = 0
-                    self.no_hand_count = 0
-            else:
-                self.hand_count = 0
-            return None, []
-
-        elif self.state == "signing":
-            if has_hands:
-                self.frames.append(landmarks.copy())
-                self.no_hand_count = 0
-
-                # Check if hands stopped moving (sign ended)
-                if self.motion_energy < 0.003 and len(self.frames) > 15:
-                    self.still_count += 1
-                else:
-                    self.still_count = 0
-
-                # Sign ended: hands still for a while OR buffer full
-                if self.still_count >= 12 or len(self.frames) >= MAX_FRAMES * 2:
-                    self.state = "cooldown"
-                    result_frames = self.frames.copy()
-                    self.frames = []
-                    self.still_count = 0
-                    self.no_hand_count = 0
-                    self.hand_count = 0
-                    return "predict", result_frames
-
-                return "recording", []
-            else:
-                self.no_hand_count += 1
-                # Hands gone for a few frames - sign ended
-                if self.no_hand_count >= 5 and len(self.frames) >= 5:
-                    self.state = "cooldown"
-                    result_frames = self.frames.copy()
-                    self.frames = []
-                    self.no_hand_count = 0
-                    self.hand_count = 0
-                    return "predict", result_frames
-                elif self.no_hand_count >= 15:
-                    # Too long without hands, discard
-                    self.state = "idle"
-                    self.frames = []
-                    self.hand_count = 0
-                return "recording", []
-
-        elif self.state == "cooldown":
-            if not has_hands:
-                self.no_hand_count += 1
-                if self.no_hand_count >= 8:
-                    self.state = "idle"
-                    self.no_hand_count = 0
-                    self.hand_count = 0
-            else:
-                # Hands still visible during cooldown, go back to signing
-                self.no_hand_count = 0
-                self.hand_count += 1
-                if self.hand_count >= 5:
-                    self.state = "signing"
-                    self.frames = []
-                    self.still_count = 0
-            return None, []
-
-        return None, []
-
-
-# ---------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------
-def subsample_frames(frames_list, target_count=MAX_FRAMES):
-    """Subsample frames to target_count, matching training pipeline."""
+def run_inference(model, frames_list, device):
+    """Run model on a list of [92, 3] landmark arrays. Returns probabilities."""
     n = len(frames_list)
-    if n <= target_count:
-        return frames_list
-    indices = np.linspace(0, n - 1, target_count, dtype=int)
-    return [frames_list[i] for i in indices]
+    if n < 5:
+        return None
 
+    # Subsample to MAX_FRAMES if we have more
+    if n > MAX_FRAMES:
+        indices = np.linspace(0, n - 1, MAX_FRAMES, dtype=int)
+        frames_list = [frames_list[i] for i in indices]
+        n = MAX_FRAMES
 
-def predict_sign(model, frames_list, device, class_names, use_amp=True):
-    """Run model inference on a list of landmark frames."""
-    if len(frames_list) < 5:
-        return None, 0.0, []
-
-    # Subsample to MAX_FRAMES (matching training data pipeline)
-    sampled = subsample_frames(frames_list, MAX_FRAMES)
-    landmarks = np.stack(sampled, axis=0).astype(np.float32)
-    num_frames = landmarks.shape[0]
+    arr = np.stack(frames_list, axis=0).astype(np.float32)
 
     # Pad to MAX_FRAMES
-    if num_frames < MAX_FRAMES:
-        pad = np.zeros((MAX_FRAMES - num_frames, NUM_LANDMARKS, NUM_COORDS), dtype=np.float32)
-        landmarks = np.concatenate([landmarks, pad], axis=0)
+    if n < MAX_FRAMES:
+        pad = np.zeros((MAX_FRAMES - n, NUM_LANDMARKS, NUM_COORDS), dtype=np.float32)
+        arr = np.concatenate([arr, pad], axis=0)
 
-    # Non-empty frame indices
-    non_empty = np.any(landmarks != 0, axis=(1, 2))
-    non_empty_idxs = np.where(non_empty, np.arange(MAX_FRAMES, dtype=np.float32), -1.0)
+    non_empty = np.any(arr != 0, axis=(1, 2))
+    ne_idxs = np.where(non_empty, np.arange(MAX_FRAMES, dtype=np.float32), -1.0)
 
-    frames_t = torch.from_numpy(landmarks).unsqueeze(0).to(device)
-    idxs_t = torch.from_numpy(non_empty_idxs).unsqueeze(0).to(device)
+    frames_t = torch.from_numpy(arr).unsqueeze(0).to(device)
+    idxs_t = torch.from_numpy(ne_idxs).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        if use_amp and device.type == "cuda":
+        if device.type == "cuda":
             with torch.amp.autocast("cuda"):
                 logits = model(frames_t, idxs_t)
         else:
             logits = model(frames_t, idxs_t)
-        probs = torch.softmax(logits, dim=1)[0].cpu()
-
-    top5_probs, top5_indices = probs.topk(5)
-    top5 = [(class_names[idx.item()], prob.item()) for idx, prob in zip(top5_indices, top5_probs)]
-    return top5[0][0], top5[0][1], top5
-
-
-# ---------------------------------------------------------------
-# Prediction smoother
-# ---------------------------------------------------------------
-class PredictionSmoother:
-    """Smooth predictions using a short history of recent results."""
-
-    def __init__(self, history_size=3):
-        self.history = collections.deque(maxlen=history_size)
-        self.current_sign = None
-        self.current_conf = 0.0
-        self.current_top5 = []
-
-    def update(self, sign, conf, top5):
-        if sign is None:
-            return
-        self.history.append((sign, conf, top5))
-
-        # Vote across recent predictions
-        votes = {}
-        for s, c, _ in self.history:
-            votes[s] = votes.get(s, 0) + c
-        best_sign = max(votes, key=votes.get)
-
-        # Find the most recent top5 for the best sign
-        for s, c, t5 in reversed(self.history):
-            if s == best_sign:
-                self.current_sign = s
-                self.current_conf = c
-                self.current_top5 = t5
-                break
-
-    def clear(self):
-        self.history.clear()
-        self.current_sign = None
-        self.current_conf = 0.0
-        self.current_top5 = []
+        return torch.softmax(logits, dim=1)[0].cpu().numpy()
 
 
 # ---------------------------------------------------------------
 # Drawing
 # ---------------------------------------------------------------
-def draw_landmarks(frame, landmarks):
+def draw_hand(frame, landmarks, offset, color, w, h):
+    for i in range(21):
+        x, y = landmarks[offset + i, 0], landmarks[offset + i, 1]
+        if x > 0 or y > 0:
+            cv2.circle(frame, (int(x * w), int(y * h)), 3, color, -1)
+    for a, b in HAND_CONNS:
+        x1, y1 = landmarks[offset + a, 0], landmarks[offset + a, 1]
+        x2, y2 = landmarks[offset + b, 0], landmarks[offset + b, 1]
+        if (x1 > 0 or y1 > 0) and (x2 > 0 or y2 > 0):
+            cv2.line(frame, (int(x1*w), int(y1*h)), (int(x2*w), int(y2*h)), color, 2)
+
+
+def draw_all(frame, lm, sign, conf, top3, hands_visible, buf_size, fps):
     h, w = frame.shape[:2]
 
-    # Lips (green dots)
-    for i in range(40):
-        x, y = landmarks[i, 0], landmarks[i, 1]
-        if x > 0 or y > 0:
-            cv2.circle(frame, (int(x * w), int(y * h)), 1, (0, 255, 0), -1)
-
-    # Left hand (blue)
-    for i in range(40, 61):
-        x, y = landmarks[i, 0], landmarks[i, 1]
-        if x > 0 or y > 0:
-            cv2.circle(frame, (int(x * w), int(y * h)), 3, (255, 150, 0), -1)
-    for a, b in HAND_CONNECTIONS:
-        x1, y1 = landmarks[40 + a, 0], landmarks[40 + a, 1]
-        x2, y2 = landmarks[40 + b, 0], landmarks[40 + b, 1]
-        if (x1 > 0 or y1 > 0) and (x2 > 0 or y2 > 0):
-            cv2.line(frame, (int(x1*w), int(y1*h)), (int(x2*w), int(y2*h)), (255, 150, 0), 2)
-
-    # Right hand (orange-red)
-    for i in range(61, 82):
-        x, y = landmarks[i, 0], landmarks[i, 1]
-        if x > 0 or y > 0:
-            cv2.circle(frame, (int(x * w), int(y * h)), 3, (0, 130, 255), -1)
-    for a, b in HAND_CONNECTIONS:
-        x1, y1 = landmarks[61 + a, 0], landmarks[61 + a, 1]
-        x2, y2 = landmarks[61 + b, 0], landmarks[61 + b, 1]
-        if (x1 > 0 or y1 > 0) and (x2 > 0 or y2 > 0):
-            cv2.line(frame, (int(x1*w), int(y1*h)), (int(x2*w), int(y2*h)), (0, 130, 255), 2)
-
-    # Pose (yellow)
-    for i in range(82, 92):
-        x, y = landmarks[i, 0], landmarks[i, 1]
-        if x > 0 or y > 0:
-            cv2.circle(frame, (int(x * w), int(y * h)), 4, (0, 255, 255), -1)
-
-
-def draw_ui(frame, smoother, state, frame_count, fps, threshold):
-    h, w = frame.shape[:2]
+    # Draw landmarks
+    draw_hand(frame, lm, 40, (255, 150, 0), w, h)   # left hand blue
+    draw_hand(frame, lm, 61, (0, 130, 255), w, h)    # right hand orange
 
     # Top bar
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 60), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+    ov = frame.copy()
+    cv2.rectangle(ov, (0, 0), (w, 40), (0, 0, 0), -1)
+    cv2.addWeighted(ov, 0.7, frame, 0.3, 0, frame)
 
-    cv2.putText(frame, "ASL Sign Recognition", (10, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(frame, f"FPS: {fps:.0f}", (w - 100, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+    cv2.putText(frame, "ASL Recognition", (8, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
-    # State indicator
-    if state == "signing":
-        # Recording state
-        if int(time.time() * 3) % 2 == 0:
-            cv2.circle(frame, (15, 45), 6, (0, 0, 255), -1)
-        cv2.putText(frame, f"Recording... ({frame_count} frames)", (28, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-    elif state == "cooldown":
-        cv2.putText(frame, "Processing...", (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 200), 1)
+    status = f"FPS:{fps:.0f} | Buf:{buf_size}"
+    cv2.putText(frame, status, (w - 160, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+
+    if hands_visible:
+        cv2.circle(frame, (w - 15, 20), 6, (0, 255, 0), -1)
     else:
-        cv2.putText(frame, "Show your hands to start", (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 120), 1)
+        cv2.circle(frame, (w - 15, 20), 6, (0, 0, 150), -1)
 
-    # Prediction result (bottom)
-    sign = smoother.current_sign
-    conf = smoother.current_conf
-    top5 = smoother.current_top5
+    # Prediction
+    if sign and conf > 0.08:
+        ov2 = frame.copy()
+        cv2.rectangle(ov2, (0, h - 100), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(ov2, 0.7, frame, 0.3, 0, frame)
 
-    if sign and conf >= threshold:
-        bar_h = 30 + len(top5) * 22
-        overlay2 = frame.copy()
-        cv2.rectangle(overlay2, (0, h - bar_h - 10), (w, h), (20, 20, 20), -1)
-        cv2.addWeighted(overlay2, 0.75, frame, 0.25, 0, frame)
+        color = (0, 255, 100) if conf > 0.4 else (0, 220, 255) if conf > 0.2 else (150, 200, 255)
 
-        # Main prediction - large text
-        if conf > 0.5:
-            color = (0, 255, 100)
-        elif conf > 0.3:
-            color = (0, 220, 255)
-        else:
-            color = (100, 180, 255)
+        # Big sign name
+        cv2.putText(frame, sign.upper(), (12, h - 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+        cv2.putText(frame, f"{conf:.0%}", (w - 70, h - 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        cv2.putText(frame, sign.upper(), (10, h - bar_h + 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-        cv2.putText(frame, f"{conf:.0%}", (w - 60, h - bar_h + 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # Top 3 bars
+        for i, (s, c) in enumerate(top3):
+            y = h - 42 + i * 16
+            bw = int(c * (w - 20))
+            bc = color if i == 0 else (50, 50, 50)
+            cv2.rectangle(frame, (8, y - 2), (8 + bw, y + 10), bc, -1)
+            cv2.putText(frame, f"{s} {c:.0%}", (12, y + 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
-        # Top-5 bars
-        for i, (s, c) in enumerate(top5):
-            y = h - bar_h + 35 + i * 22
-            bar_len = int(c * (w - 130))
-            bar_color = color if i == 0 else (60, 60, 60)
-            cv2.rectangle(frame, (10, y - 2), (10 + bar_len, y + 14), bar_color, -1)
-            cv2.putText(frame, f"{s} ({c:.0%})", (15, y + 11),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-    # Controls
-    cv2.putText(frame, "SPACE: Predict | C: Clear | Q: Quit", (5, h - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+    cv2.putText(frame, "Q:Quit  C:Clear", (8, h - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 80), 1)
 
 
 # ---------------------------------------------------------------
-# Main loop
+# Main
 # ---------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Real-time ASL Sign Recognition")
@@ -591,29 +376,23 @@ def main():
     parser.add_argument("--mediapipe-dir", type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "mediapipe_models"))
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--threshold", type=float, default=0.10,
-                        help="Min confidence to display prediction")
     args = parser.parse_args()
 
-    # Load model
+    # ---- Load model ----
     print("Loading model...")
-    if not os.path.exists(args.model):
-        print(f"ERROR: Model not found: {args.model}")
-        sys.exit(1)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    checkpoint = torch.load(args.model, map_location=device, weights_only=False)
 
-    config = checkpoint.get("config", {})
-    num_classes = checkpoint.get("num_classes", 256)
+    ckpt = torch.load(args.model, map_location=device, weights_only=False)
+    config = ckpt.get("config", {})
+    num_classes = ckpt.get("num_classes", 256)
 
     class_map_path = os.path.join(os.path.dirname(args.model), "class_map.json")
     if os.path.exists(class_map_path):
         with open(class_map_path) as f:
             class_names = {int(k): v for k, v in json.load(f).items()}
     else:
-        class_names = {i: name for i, name in enumerate(checkpoint.get("class_names", []))}
+        class_names = {i: n for i, n in enumerate(ckpt.get("class_names", []))}
 
     model = LandmarkTransformer(
         num_classes=num_classes,
@@ -623,56 +402,55 @@ def main():
         num_heads=config.get("num_heads", 8),
         dropout=config.get("dropout", 0.15),
     ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    print(f"Model: {num_classes} classes, val acc: {checkpoint.get('best_val_acc', 0)*100:.1f}%")
+    print(f"Loaded: {num_classes} classes, {ckpt.get('best_val_acc',0)*100:.1f}% val acc")
 
-    # Warmup inference (first run is slow due to CUDA compilation)
+    # Warmup
     if device.type == "cuda":
-        dummy_f = torch.zeros(1, MAX_FRAMES, NUM_LANDMARKS, NUM_COORDS, device=device)
-        dummy_i = torch.full((1, MAX_FRAMES), -1.0, device=device)
-        dummy_i[0, 0] = 0.0
-        with torch.no_grad():
-            with torch.amp.autocast("cuda"):
-                model(dummy_f, dummy_i)
-        print("CUDA warmup done")
+        d_f = torch.zeros(1, MAX_FRAMES, NUM_LANDMARKS, NUM_COORDS, device=device)
+        d_i = torch.full((1, MAX_FRAMES), -1.0, device=device)
+        d_i[0, 0] = 0.0
+        with torch.no_grad(), torch.amp.autocast("cuda"):
+            model(d_f, d_i)
+        del d_f, d_i
+        print("GPU warm")
 
-    # Load MediaPipe
+    # ---- MediaPipe ----
     print("Loading MediaPipe...")
-    if not os.path.exists(args.mediapipe_dir):
-        print(f"ERROR: MediaPipe models not found: {args.mediapipe_dir}")
-        sys.exit(1)
     extractor = LandmarkExtractor(args.mediapipe_dir)
 
-    # Open webcam
-    print(f"Opening camera {args.camera}...")
+    # ---- Camera ----
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        print("ERROR: Cannot open camera")
+        print("ERROR: camera failed")
         extractor.close()
         sys.exit(1)
-
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    print()
-    print("=" * 45)
-    print("  ASL Sign Recognition - READY")
-    print("  Just show your hands and perform a sign!")
-    print("  Q=Quit  C=Clear  SPACE=Force predict")
-    print("=" * 45)
-    print()
+    print("\n  READY - Just show your hands and do a sign!\n")
 
-    detector = SignDetector()
-    smoother = PredictionSmoother(history_size=3)
+    # ---- State ----
+    # Sliding window: keep last ~2 sec of frames where hands were visible
+    hand_buffer = collections.deque(maxlen=MAX_FRAMES)
 
+    # Prediction state
+    cur_sign = None
+    cur_conf = 0.0
+    cur_top3 = []
+
+    # Smoothing: accumulate probability over recent predictions
+    avg_probs = None
+    smooth_alpha = 0.4  # weight for new prediction (higher = more responsive)
+
+    # Timing
     fps = 0.0
-    fps_time = time.time()
-    fps_count = 0
+    fps_t = time.time()
+    fps_c = 0
     frame_idx = 0
-    manual_buffer = []
-    manual_recording = False
+    predict_interval = 12  # predict every N frames (~0.4s at 30fps)
 
     while True:
         ret, bgr = cap.read()
@@ -683,83 +461,69 @@ def main():
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         # FPS
-        fps_count += 1
+        fps_c += 1
         now = time.time()
-        if now - fps_time >= 1.0:
-            fps = fps_count / (now - fps_time)
-            fps_count = 0
-            fps_time = now
+        if now - fps_t >= 1.0:
+            fps = fps_c / (now - fps_t)
+            fps_c = 0
+            fps_t = now
 
-        # Extract landmarks
-        # Full extraction every 3rd frame, hands-only otherwise (faster)
+        # Extract landmarks (full every 3 frames, hands-only otherwise)
         if frame_idx % 3 == 0:
-            landmarks = extractor.extract(rgb)
+            lm = extractor.extract_all(rgb)
         else:
-            landmarks = extractor.extract_hands_only(rgb)
-        frame_idx += 1
+            lm = extractor.extract_hands_fast(rgb)
 
-        # Manual recording mode
-        if manual_recording:
-            if np.any(landmarks != 0):
-                manual_buffer.append(landmarks.copy())
-            draw_landmarks(bgr, landmarks)
-            draw_ui(bgr, smoother, "signing", len(manual_buffer), fps, args.threshold)
-            cv2.imshow("ASL Sign Recognition", bgr)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord(' '):
-                # Force predict
-                manual_recording = False
-                if len(manual_buffer) >= 5:
-                    sign, conf, top5 = predict_sign(model, manual_buffer, device, class_names)
-                    if sign:
-                        smoother.update(sign, conf, top5)
-                        print(f">> {sign.upper()} ({conf:.0%})")
-                manual_buffer = []
-            elif key == ord('q') or key == ord('Q'):
-                break
-            elif key == ord('c') or key == ord('C'):
-                manual_recording = False
-                manual_buffer = []
-                smoother.clear()
-            continue
+        # Check if hands visible
+        hands_visible = np.any(lm[40:82] != 0)
 
-        # Auto detection
-        event, frames = detector.update(landmarks)
+        # Add to buffer only if hands detected
+        if hands_visible:
+            hand_buffer.append(lm.copy())
 
-        if event == "predict" and len(frames) >= 5:
-            sign, conf, top5 = predict_sign(model, frames, device, class_names)
-            if sign:
-                smoother.update(sign, conf, top5)
-                print(f">> {sign.upper()} ({conf:.0%})")
+        # Run prediction every predict_interval frames (if we have enough data)
+        if frame_idx % predict_interval == 0 and len(hand_buffer) >= 8:
+            probs = run_inference(model, list(hand_buffer), device)
+            if probs is not None:
+                # Exponential moving average for smoothing
+                if avg_probs is None:
+                    avg_probs = probs
+                else:
+                    avg_probs = smooth_alpha * probs + (1 - smooth_alpha) * avg_probs
+
+                top_idx = np.argsort(avg_probs)[::-1][:3]
+                cur_sign = class_names.get(top_idx[0], "?")
+                cur_conf = avg_probs[top_idx[0]]
+                cur_top3 = [(class_names.get(i, "?"), float(avg_probs[i])) for i in top_idx]
+
+                print(f"\r  >> {cur_sign.upper():15s} {cur_conf:5.0%}  "
+                      f"(buf={len(hand_buffer):2d})", end="", flush=True)
+
+        # If no hands for a while, decay the buffer
+        if not hands_visible and len(hand_buffer) > 0:
+            # After hands disappear, keep the buffer for a bit to show last prediction
+            # But don't add empty frames
+            pass
 
         # Draw
-        draw_landmarks(bgr, landmarks)
-        draw_ui(bgr, smoother, detector.state,
-                len(detector.frames), fps, args.threshold)
-
+        draw_all(bgr, lm, cur_sign, cur_conf, cur_top3,
+                 hands_visible, len(hand_buffer), fps)
         cv2.imshow("ASL Sign Recognition", bgr)
+
+        frame_idx += 1
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == ord('Q'):
             break
         elif key == ord('c') or key == ord('C'):
-            smoother.clear()
-            detector = SignDetector()
-        elif key == ord(' '):
-            # Force predict on whatever we have
-            if len(detector.frames) >= 5:
-                sign, conf, top5 = predict_sign(
-                    model, detector.frames, device, class_names)
-                if sign:
-                    smoother.update(sign, conf, top5)
-                    print(f">> {sign.upper()} ({conf:.0%})")
-                detector = SignDetector()
-            else:
-                # Start manual recording
-                manual_recording = True
-                manual_buffer = []
-                print("Manual recording - press SPACE again to predict")
+            hand_buffer.clear()
+            avg_probs = None
+            cur_sign = None
+            cur_conf = 0.0
+            cur_top3 = []
+            print("\r  [Cleared]" + " " * 40, end="", flush=True)
 
+    print()
     cap.release()
     cv2.destroyAllWindows()
     extractor.close()
