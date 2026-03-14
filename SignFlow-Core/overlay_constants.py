@@ -9,7 +9,7 @@ EXCLUDE_OVERLAY_FROM_CAPTURE = False
 
 # CAPTURE / PREVIEW
 CAPTURE_FPS = 30
-CAPTURE_FLIP_HORIZONTAL = True
+CAPTURE_FLIP_HORIZONTAL = False
 SIGN_PREDICTION_MIN_CONFIDENCE = 0.15
 DETECTION_MAX_DIM = 640
 DETECTION_MIN_DIM = 320
@@ -109,7 +109,7 @@ DEFAULT_SETTINGS = {
     "show_raw_tokens": False,
     "freeze_on_detection_loss": False,
     "enable_llm_smoothing": False,
-    "model_selection": MODEL_OPTIONS[0],
+    "model_selection": MODEL_OPTIONS[1],
     "show_latency": False,
     "corner": DEFAULT_CORNER,
 }

@@ -4,7 +4,7 @@
   "show_raw_tokens": false,
   "freeze_on_detection_loss": false,
   "enable_llm_smoothing": false,
-  "model_selection": "Local Small",
+  "model_selection": "Local Medium",
   "show_latency": false,
   "corner": "Bottom Right"
 }
