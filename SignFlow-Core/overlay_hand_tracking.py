@@ -73,9 +73,9 @@ from overlay_constants import (
 MAX_FRAMES = 64
 NUM_LANDMARKS = 92
 NUM_COORDS = 3
-PREDICT_INTERVAL = 4
+PREDICT_INTERVAL = 3
 SMOOTH_ALPHA = 0.6
-MIN_BUFFER_FRAMES = 8
+MIN_BUFFER_FRAMES = 6
 LANDMARK_BUFFER_SIZE = 64
 
 LIPS_FACE_IDXS = np.array([
@@ -97,22 +97,23 @@ HAND_CONNS = [
 # ===============================================================
 # HAND CROP HELPER (for SigLIP2 image-based alphabet model)
 # ===============================================================
-HAND_CROP_PADDING = 0.65  # 65% padding — generous context around the hand
-SIGLIP_SMOOTH_ALPHA = 0.5  # EMA smoothing for SigLIP predictions
-MIN_CROP_PX = 40  # minimum crop size in pixels (skip tiny crops)
+HAND_CROP_PADDING = 0.45  # 45% padding — hand stays prominent, enough context
+SIGLIP_SMOOTH_ALPHA = 0.4  # EMA smoothing for SigLIP predictions (lower = more responsive)
+MIN_CROP_PX = 50  # minimum crop size in pixels (skip tiny crops)
+SIGLIP_CONF_THRESHOLD = 0.40  # minimum raw confidence to accept SigLIP prediction
 
 
 def crop_hand_region(image, lm_92, offset, h, w):
     """Crop a square hand region from image using landmarks at lm_92[offset:offset+21].
-    Returns (original_pil, flipped_pil) or (None, None) if no hand visible."""
+    Returns PIL Image or None if no hand visible."""
     hand_lm = lm_92[offset:offset + 21]
     valid = np.any(hand_lm != 0, axis=1)
     if not np.any(valid):
-        return None, None
+        return None
     pts = hand_lm[valid, :2]  # (N, 2) in [0..1]
     x_min, y_min = pts.min(axis=0)
     x_max, y_max = pts.max(axis=0)
-    # Add generous padding
+    # Add padding
     dx = (x_max - x_min) * HAND_CROP_PADDING
     dy = (y_max - y_min) * HAND_CROP_PADDING
     x_min = max(0.0, x_min - dx)
@@ -130,13 +131,11 @@ def crop_hand_region(image, lm_92, offset, h, w):
     px1, py1 = int(x_min * w), int(y_min * h)
     px2, py2 = int(x_max * w), int(y_max * h)
     if px2 - px1 < MIN_CROP_PX or py2 - py1 < MIN_CROP_PX:
-        return None, None
+        return None
     crop = image[py1:py2, px1:px2]
     if not _SIGLIP_AVAILABLE:
-        return None, None
-    original = PILImage.fromarray(crop)
-    flipped = original.transpose(PILImage.FLIP_LEFT_RIGHT)
-    return original, flipped
+        return None
+    return PILImage.fromarray(crop)
 
 
 # ===============================================================
@@ -562,52 +561,59 @@ class HandTracker:
         siglip_conf = 0.0
 
         if hands_visible and self._siglip_model is not None and self._siglip_processor is not None:
-            # Crop hand region(s), try BOTH original + flipped orientations
+            # Collect all crop images for batch inference (original + flipped)
+            crop_images = []
+            for offset in [61, 40]:  # right hand first, then left
+                crop = crop_hand_region(extract_image, lm, offset, height, width)
+                if crop is not None:
+                    crop_images.append(crop)
+                    crop_images.append(crop.transpose(PILImage.FLIP_LEFT_RIGHT))
+
             best_raw_conf = 0.0
             best_raw_label = "No Hand"
 
-            for offset in [61, 40]:  # right hand first, then left
-                orig_crop, flip_crop = crop_hand_region(extract_image, lm, offset, height, width)
-                if orig_crop is None:
-                    continue
-                # Test both orientations — training data may differ from screen capture
-                for crop_img in [orig_crop, flip_crop]:
-                    try:
-                        inputs = self._siglip_processor(images=crop_img, return_tensors="pt")
-                        inputs = {k: v.to(self._siglip_device) for k, v in inputs.items()}
-                        with torch.no_grad():
-                            if self._siglip_device.type == "cuda":
-                                with torch.amp.autocast("cuda"):
-                                    logits = self._siglip_model(**inputs).logits
-                            else:
+            if crop_images:
+                try:
+                    # Batch all crops into single forward pass for speed
+                    inputs = self._siglip_processor(images=crop_images, return_tensors="pt")
+                    inputs = {k: v.to(self._siglip_device) for k, v in inputs.items()}
+                    with torch.no_grad():
+                        if self._siglip_device.type == "cuda":
+                            with torch.amp.autocast("cuda"):
                                 logits = self._siglip_model(**inputs).logits
-                            probs = torch.softmax(logits.float(), dim=1)[0]
+                        else:
+                            logits = self._siglip_model(**inputs).logits
+                        all_probs = torch.softmax(logits.float(), dim=1)  # [N, 26]
+
+                    # Pick the crop with highest confidence
+                    for i in range(all_probs.shape[0]):
+                        probs = all_probs[i]
                         top_conf = float(probs.max())
                         top_idx = int(probs.argmax())
                         if top_conf > best_raw_conf:
                             best_raw_conf = top_conf
                             best_raw_label = self._siglip_model.config.id2label.get(
                                 top_idx, str(top_idx))
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
             # EMA smoothing for stable predictions
-            if best_raw_conf >= 0.25:
+            if best_raw_conf >= SIGLIP_CONF_THRESHOLD:
                 if self._siglip_avg_label == best_raw_label:
                     # Same label — smooth confidence upward
                     self._siglip_avg_conf = (
                         SIGLIP_SMOOTH_ALPHA * best_raw_conf
                         + (1 - SIGLIP_SMOOTH_ALPHA) * self._siglip_avg_conf)
                 else:
-                    # New label detected — only switch if confident enough
-                    if best_raw_conf > self._siglip_avg_conf * 0.8:
+                    # New label — switch quickly if confident
+                    if best_raw_conf > 0.4 or best_raw_conf > self._siglip_avg_conf:
                         self._siglip_avg_label = best_raw_label
-                        self._siglip_avg_conf = best_raw_conf * 0.7
+                        self._siglip_avg_conf = best_raw_conf * 0.85
                 siglip_text = self._siglip_avg_label
                 siglip_conf = self._siglip_avg_conf
             else:
                 # Decay confidence when no good detection
-                self._siglip_avg_conf *= 0.8
+                self._siglip_avg_conf *= 0.85
                 if self._siglip_avg_conf > 0.15 and self._siglip_avg_label is not None:
                     siglip_text = self._siglip_avg_label
                     siglip_conf = self._siglip_avg_conf
@@ -645,25 +651,35 @@ class HandTracker:
                 transformer_text = "Uncertain"
 
         # --- Step 4: Pick the best prediction ---
+        # Strategy: SigLIP is better for static signs (A-Z), transformer for motion.
+        # If SigLIP is highly confident (>0.6), it's likely a real static sign — prefer it.
+        # Otherwise fall back to transformer which tracks motion patterns.
         prediction_text = "No Hand"
         prediction_conf = 0.0
 
         if not hands_visible:
             prediction_text = "No Hand"
             prediction_conf = 0.0
-        elif transformer_conf >= siglip_conf:
-            prediction_text = transformer_text
-            prediction_conf = transformer_conf
-        else:
+        elif siglip_conf >= 0.6:
+            # SigLIP very confident — this is a clear static alphabet sign
             prediction_text = siglip_text
             prediction_conf = siglip_conf
+        elif transformer_conf >= siglip_conf and transformer_text not in ("No Hand", "Uncertain"):
+            prediction_text = transformer_text
+            prediction_conf = transformer_conf
+        elif siglip_text not in ("No Hand", "Uncertain"):
+            prediction_text = siglip_text
+            prediction_conf = siglip_conf
+        elif transformer_text not in ("No Hand", "Uncertain"):
+            prediction_text = transformer_text
+            prediction_conf = transformer_conf
 
-        # If both uncertain, show best available
-        if prediction_text == "Uncertain" and hands_visible:
-            if transformer_conf > siglip_conf and transformer_text != "Uncertain":
+        # If still uncertain, show whatever has any confidence
+        if prediction_text in ("No Hand", "Uncertain") and hands_visible:
+            if transformer_conf > siglip_conf and transformer_text not in ("No Hand", "Uncertain"):
                 prediction_text = transformer_text
                 prediction_conf = transformer_conf
-            elif siglip_text != "Uncertain":
+            elif siglip_text not in ("No Hand", "Uncertain"):
                 prediction_text = siglip_text
                 prediction_conf = siglip_conf
 
