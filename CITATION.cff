@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use SignFlow or cite its benchmark evaluation, please cite this work as below."
+title: "SignFlow: Real-Time Multi-Modal Sign Language Recognition via 12-Stream Hybrid Architecture on the Full-Vocabulary ASL Citizen Benchmark"
+authors:
+  - family-names: "G"
+    given-names: "Nithin"
+    affiliation: "Independent Researcher"
+date-released: "2026-11-09"
+doi: "10.5281/zenodo.24088419"
+url: "https://zenodo.org/records/24088419"
+repository-code: "https://github.com/nithin2719-commits/SIGNFLOW"
+license: "MIT"
+keywords:
+  - "sign-language-recognition"
+  - "asl-citizen"
+  - "isolated-sign-language-recognition"
+  - "computer-vision"
+  - "deep-learning"
+  - "sota"
+  - "accessibility"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "G"
+      given-names: "Nithin"
+      affiliation: "Independent Researcher"
+  title: "SignFlow: Real-Time Multi-Modal Sign Language Recognition via 12-Stream Hybrid Architecture on the Full-Vocabulary ASL Citizen Benchmark"
+  doi: "10.5281/zenodo.24088419"
+  url: "https://doi.org/10.5281/zenodo.24088419"
+  year: 2026
+  month: 11
+  publisher: "Zenodo"
