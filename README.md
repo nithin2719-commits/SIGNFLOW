@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔮 SignFlow: Real-Time Multi-Modal Sign Language Recognition
+# SignFlow: Real-Time Multi-Modal Sign Language Recognition
 
 ### *A 12-Stream Hybrid Architecture on the Full-Vocabulary ASL Citizen Benchmark*
 
